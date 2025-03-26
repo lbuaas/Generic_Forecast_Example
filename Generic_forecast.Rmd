@@ -11,20 +11,20 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ```{r}
 # Load Libraries
-if(!require(tidyverse)) install.packages("tidyverse")
-if(!require(lubridate)) install.packages("lubridate")
-if(!require(gridExtra)) install.packages("gridExtra")
-if(!require(timetk)) install.packages("timetk")
-if(!require(reshape2)) install.packages("reshape2")
-if(!require(Boruta)) install.packages("Boruta")
-if(!require(imputeTS)) install.packages("imputeTS")
-if(!require(modeltime)) install.packages("modeltime")
-if(!require(parsnip)) install.packages("parsnip")
-if(!require(recipes)) install.packages("recipes")
-if(!require(workflows)) install.packages("workflows")
-if(!require(readxl)) install.packages("readxl")
-if(!require(rsample)) install.packages("rsample")
-if(!require(glmnet)) install.packages("glmnet")
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(gridExtra)) install.packages("gridExtra", repos = "http://cran.us.r-project.org")
+if(!require(timetk)) install.packages("timetk", repos = "http://cran.us.r-project.org")
+if(!require(reshape2)) install.packages("reshape2", repos = "https://cran.us.r-project.org")
+if(!require(Boruta)) install.packages("Boruta", repos = "https://cran.us.r-project.org")
+if(!require(imputeTS)) install.packages("imputeTS", repos = "https://cran.us.r-project.org")
+if(!require(modeltime)) install.packages("modeltime", repos = "https://cran.us.r-project.org")
+if(!require(parsnip)) install.packages("parsnip", repos = "https://cran.us.r-project.org")
+if(!require(recipes)) install.packages("recipes", repos = "https://cran.us.r-project.org")
+if(!require(workflows)) install.packages("workflows", repos = "https://cran.us.r-project.org")
+if(!require(readxl)) install.packages("readxl", repos = "https://cran.us.r-project.org")
+if(!require(rsample)) install.packages("rsample", repos = "https://cran.us.r-project.org")
+if(!require(glmnet)) install.packages("glmnet", repos = "https://cran.us.r-project.org")
 if(!require(zoo)) install.packages("zoo")
 ```
 
@@ -40,14 +40,14 @@ names(df_calls) <- c("Date", "Day", "Calls")
 df_calls <- df_calls %>%
   mutate(Day = as.factor(Day))
 
-df_promos <- read_xlsx("data/Promotion_forecast_data.xlsx", sheet = "Promos") %>%
+df_promos <- read_xlsx("data/Promotion_forecast_data.xlsx", sheet = "JPN_Promos") %>%
   mutate(Date = ymd(Date),
          Promo_1 = as.integer(Promo_1),
          Promo_2 = as.integer(Promo_2),
          Promo_3 = as.integer(Promo_3),
          Promo_4 = as.integer(Promo_4),
          Promo_5 = as.integer(Promo_5),
-         Promo_6 = as.integer(Promo_7),
+         Promo_6 = as.integer(Promo_6),
          Promo_7 = as.integer(Promo_7),
          Promo_8 = as.integer(Promo_8),
          Promo_9 = as.integer(Promo_9),
@@ -69,15 +69,20 @@ df_calls <- df_calls %>%
   
 
 # Adds Holiday Column
+
+# Below I will split the dataframe into 2 sections due to the nature of the holiday calendar.
+# This calendar only has holidays post 2024-07-31, meaning I will use the actual past data to 
+# determine the previous holidays, while using the calendar for the rest.
+
 df_calls_1 <- df_calls %>%
   filter(Date <= as.Date("2024-07-31")) %>%
   mutate(Holiday = ifelse(Calls == 0 , 1, 0)) 
 
-holiday_2024 <- read_excel("data/Holiday_data.xlsx") %>%
+holiday <- read_excel("data/Holiday_data.xlsx") %>%
   select(1,2)
 
 df_calls_2 <- left_join(df_calls %>% filter(Date > as.Date("2024-07-31")),
-                        holiday_2024, 
+                        holiday, 
                         by = "Date") %>%
   mutate(Holiday = ifelse(Break == 1 | Day %in% c("Saturday","Sunday"), 1, 0)) %>%
   select(-Break)
@@ -85,51 +90,70 @@ df_calls_2 <- left_join(df_calls %>% filter(Date > as.Date("2024-07-31")),
 df_calls <- rbind(df_calls_1,df_calls_2) %>%
   replace_na(list(Holiday = 0))
 
-rm(df_calls_1,df_calls_2,holiday_2024)
+rm(df_calls_1,df_calls_2,holiday)
   
 ###################################################################
 
-# Orders Forecast #
+```
 
-# Loads Orders and changes entry date/time to Japanese time
+```{r}
+# Loads Order data
+orders <- rbind(
+  read.csv("data/OrderDetails_2020.csv"),
+  read.csv("data/OrderDetails_2021.csv"),
+  read.csv("data/OrderDetails_2022.csv"),
+  read.csv("data/OrderDetails_2023.csv"),
+  read.csv("data/OrderDetails_2024.csv")
+)
+
+orders_2025 <- read_csv("data/OrderDetails_2025_until_feb.csv")
+```
+
+```{r}
+# Adds other 2025 Order datas -- FUTURE USE
+orders_2025 <- rbind(
+  orders_2025,
+  read_csv("data/FUTURE_ORDER_DATA.csv")
+)
+```
+
+
+```{r}
+# Converts time to Japan Time and gets order count
+df_orders <- orders %>%
+  mutate(
+    entry_date = ymd(entry_date),  # Converts character to Date
+    Date_us = as_datetime(paste(entry_date, entry_time)),
+    Date_Japan = Date_us + hours(15)
+         ) %>%
+    mutate(Date_Japan = as_date(Date_Japan)) %>%
+    filter(!(order_entry_init %in% c("*AS", "*WB"))) %>%
+    group_by(Date_Japan) %>%
+    summarise(order_count = n(),
+              .groups = 'drop')
+
+# Check the dates for 2025 to see if the format stays in mdy format or changes to ymd
+df_orders_2025 <- orders_2025 %>%
+  mutate(
+    entry_date = mdy(entry_date),  # Converts character to Date
+    Date_us = as_datetime(paste(entry_date, entry_time)),
+    Date_Japan = Date_us + hours(15)
+         ) %>%
+    mutate(Date_Japan = as_date(Date_Japan)) %>%
+    filter(!(order_entry_init %in% c("*AS", "*WB"))) %>%
+    group_by(Date_Japan) %>%
+    summarise(order_count = n(),
+              .groups = 'drop')
+
 df_orders <- rbind(
-  read_csv("data/Orders_2020.csv") %>%
-    mutate(Date_us = as_datetime(paste(entry_date, entry_time)),
-           Date_Japan = as_datetime(Date_us + hours(15))) %>%
-    mutate(Date_Japan = as_date(Date_Japan)) %>%
-    filter(!(order_entry_init %in% c("*AS", "*WB"))) %>%
-    group_by(Date_Japan) %>%
-    summarise(order_count = n()),
-  read_csv("data/Orders_2021.csv") %>%
-    mutate(Date_us = as_datetime(paste(entry_date, entry_time)),
-           Date_Japan = as_datetime(Date_us + hours(15))) %>%
-    mutate(Date_Japan = as_date(Date_Japan)) %>%
-    filter(!(order_entry_init %in% c("*AS", "*WB"))) %>%
-    group_by(Date_Japan) %>%
-    summarise(order_count = n()),
-  read_csv("data/Orders_2022.csv") %>%
-    mutate(Date_us = as_datetime(paste(entry_date, entry_time)),
-           Date_Japan = as_datetime(Date_us + hours(15))) %>%
-    mutate(Date_Japan = as_date(Date_Japan)) %>%
-    filter(!(order_entry_init %in% c("*AS", "*WB"))) %>%
-    group_by(Date_Japan) %>%
-    summarise(order_count = n()),
-  read_csv("data/Orders_2023.csv") %>%
-    mutate(Date_us = as_datetime(paste(entry_date, entry_time)),
-           Date_Japan = as_datetime(Date_us + hours(15))) %>%
-    mutate(Date_Japan = as_date(Date_Japan)) %>%
-    filter(!(order_entry_init %in% c("*AS", "*WB"))) %>%
-    group_by(Date_Japan) %>%
-    summarise(order_count = n()),
-  read_csv("data/Orders_2024.csv") %>%
-    mutate(Date_us = as_datetime(paste(entry_date, entry_time)),
-           Date_Japan = as_datetime(Date_us + hours(15))) %>%
-    mutate(Date_Japan = as_date(Date_Japan)) %>%
-    filter(!(order_entry_init %in% c("*AS", "*WB"))) %>%
-    group_by(Date_Japan) %>%
-    summarise(order_count = n())
-  )
+  df_orders,
+  df_orders_2025
+)
 
+rm(df_orders_2025)
+```
+
+```{r}
 # Combines orders and promo data
 df_orders <- left_join(df_calls %>% 
                          select(-Calls),
@@ -192,7 +216,6 @@ rm(detrended_orders,stl_decomposition,trend_component)
 ```
 
 ```{r}
-# Looks at variable correlation
 df_orders %>%
   drop_na() %>%
   select(-Date, -Day) %>%
@@ -201,27 +224,14 @@ df_orders %>%
 ```
 
 ```{r}
-# Creates splits to create initial time series models
+# Creates splits to test timeseries models
 lag_df_orders <- df_orders %>%
   arrange(Date) %>%
   filter(Date <= (Sys.Date() + days(90))) %>% # Only shows data 3 months from the date the code is ran
-  mutate(Orders_lag1 = lag(order_count,1)) %>% # Adds one working day's worth of lag
+  mutate(Orders_lag1 = lag(order_count,1)) %>% 
   filter(Date > "2020-01-06") 
 
-# Calculates weekly lag. If unavailable interpolates value of weekly lag
-week_lag <- df_orders %>%
-  select(Date,order_count) %>%
-  mutate(next_week = Date + days(7)) %>%
-  filter(next_week >= "2019-01-01") %>%
-  select(next_week,order_count) %>%
-  rename("Orders_lag_week" = "order_count")
-
-lag_df_orders <- left_join(lag_df_orders,week_lag, by = c("Date" = "next_week")) %>%
-  filter(Date > "2020-01-10") %>%
-  mutate(Orders_lag_week = ifelse(Orders_lag_week == 0, NA, Orders_lag_week),
-         Orders_lag_week = na.approx(Orders_lag_week, na.rm = FALSE)) 
-
-# Creates data splits
+# Tries model without lag due to weekend/holidays
 Splits <- initial_time_split(lag_df_orders %>%
                                drop_na(), prop = 0.85)
 
@@ -241,14 +251,12 @@ recipe_spec_2 <- recipe(order_count ~ ., training(Splits)) %>%
   step_timeseries_signature(Date) %>%
   step_fourier(Date, period = 12, K = 2) %>%
   step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
-  # step_zv(all_predictors()) %>%
   step_dummy(all_nominal_predictors(), one_hot = TRUE) 
 
 recipe_spec_3 <- recipe(order_count ~ ., training(Splits)) %>%
   step_timeseries_signature(Date) %>%
   step_fourier(Date, period = 12, K = 3) %>%
   step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
-  # step_zv(all_predictors()) %>%
   step_dummy(all_nominal_predictors(), one_hot = TRUE)
 
 ###########################
@@ -342,12 +350,6 @@ fit_arima_boosted_2 <- workflow() %>%
 
 ###########################
 ### Non ML Moels
-# Exponential Smoothing
-fit_ets_2 <- workflow() %>%
-  add_model(exp_smoothing() %>% set_engine("ets")) %>%
-  add_recipe(recipe_spec_2) %>%
-  fit(training(Splits))
-
 # Prophet
 fit_prophet_2 <- workflow() %>%
   add_model(prophet_reg() %>% set_engine("prophet")) %>%
@@ -394,12 +396,6 @@ fit_arima_boosted_3 <- workflow() %>%
 
 ###########################
 ### Non ML Moels
-# Exponential Smoothing
-fit_ets_3 <- workflow() %>%
-  add_model(exp_smoothing() %>% set_engine("ets")) %>%
-  add_recipe(recipe_spec_3) %>%
-  fit(training(Splits))
-
 # Prophet
 fit_prophet_3 <- workflow() %>%
   add_model(prophet_reg() %>% set_engine("prophet")) %>%
@@ -427,8 +423,6 @@ models_tbl <-
     fit_arima_boosted_2,
     fit_arima_boosted_3,
     fit_ets,
-    fit_ets_2,
-    fit_ets_3,
     fit_prophet,
     fit_prophet_2,
     fit_prophet_3
@@ -452,8 +446,6 @@ rm(
     fit_arima_boosted_2,
     fit_arima_boosted_3,
     fit_ets,
-    fit_ets_2,
-    fit_ets_3,
     fit_prophet,
     fit_prophet_2,
     fit_prophet_3,
@@ -468,7 +460,7 @@ calibration_table <- models_tbl %>%
 ```
 
 ```{r}
-# Plots time series models
+# Plots timeseries models
 calibration_table %>%
   modeltime_forecast(
     new_data = testing(Splits),
@@ -488,7 +480,6 @@ calibration_table %>%
 ```
 
 ```{r}
-# Creates "final" df to visualize variables
 df_orders_final <- recipe(order_count ~ ., df_orders) %>%
   step_timeseries_signature(Date) %>%
   step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
@@ -509,9 +500,8 @@ min_rmse_model <- calibration_table %>%
   pull()
 
 #####
-# Forecast
+# Luke test forecast
 #####
-
 actual_orders_data <- lag_df_orders %>%
   filter(!(is.na(order_count)))
 
@@ -519,11 +509,11 @@ new_data <- lag_df_orders %>%
   filter(is.na(order_count)) %>%
   filter(!(is.na(Orders_lag1)))
 
-#Luke's Forecast
-# Defines the number of days out you forecast (60 = 60 days)
+# Luke's Forecast
+# Defines how many months out you want to filter (60 = 60 days)
 forecast_horizon <- 60
 
-# Writes forecasting function incorporating lags
+# Creates a for loop forecasting code to add in the lag values
 generate_forecast <- function(min_rmse_model, actual_orders_data, lag_df_orders, 
                               new_data, forecast_horizon) {
   
@@ -536,17 +526,20 @@ generate_forecast <- function(min_rmse_model, actual_orders_data, lag_df_orders,
         .conf_lo = NA,
         .conf_hi = NA,
         .key = "actual",
-        .model_desc = "ACTUAL",
+        .model_dePromo_2 = "ACTUAL",
         .model_id = NA
     ) %>%
-    select(.index, .value, .conf_lo, .conf_hi, .key, .model_desc, .model_id)
+    select(.index, .value, .conf_lo, .conf_hi, .key, .model_dePromo_2, .model_id)
   
   lag_df_orders <- lag_df_orders
   
   for (i in 1:forecast_horizon) {
     forecast <- calibration_table %>%
       filter(.model_id %in% min_rmse_model) %>%
-      modeltime_refit(actual_orders_data) %>%
+      modeltime_refit(lag_df_orders %>%
+                        filter(!(is.na(order_count))) %>%
+                        filter(!(is.na(Orders_lag1))) 
+                      ) %>%
       modeltime_forecast(
         new_data = new_data,
         actual_data = forecast_results
@@ -580,8 +573,8 @@ generate_forecast <- function(min_rmse_model, actual_orders_data, lag_df_orders,
       pull(Date)
     next_row <- data.frame(Date = next_date,
                            order_count = forecasted_value,
-                           Orders_lag1 = NA,
-                           Orders_lag_week = NA)
+                           Orders_lag1 = NA)#,
+                           #Orders_lag_week = NA)
     
     forecast_results <- bind_rows(forecast_results, next_row)
     
@@ -592,9 +585,9 @@ generate_forecast <- function(min_rmse_model, actual_orders_data, lag_df_orders,
       .conf_lo = forecasted_lo,
       .conf_hi = forecasted_hi,
       .key = "prediction",
-      .model_desc = calibration_table %>%
+      .model_dePromo_2 = calibration_table %>%
         filter(.model_id %in% min_rmse_model) %>%
-        pull(.model_desc),
+        pull(.model_dePromo_2),
       .model_id = min_rmse_model
     )
     
@@ -605,20 +598,10 @@ generate_forecast <- function(min_rmse_model, actual_orders_data, lag_df_orders,
       mutate(
         order_count = if_else(Date == next_date, forecasted_value, order_count),
         Orders_lag1 = lag(order_count,1)
-      ) %>%
-      select(-Orders_lag_week)
+      ) 
     
-    # Adds week lag variable
-    week_lag <- lag_df_orders %>%
-      select(Date,order_count) %>%
-      mutate(next_week = Date + days(7)) %>%
-      select(next_week, order_count) %>%
-      rename("Orders_lag_week" = "order_count")
-    
-    lag_df_orders <- left_join(lag_df_orders,week_lag, by = c("Date" = "next_week")) %>%
-      mutate(Orders_lag_week = ifelse(Orders_lag_week == 0, NA, Orders_lag_week),
-             Orders_lag_week = na.approx(Orders_lag_week, na.rm = FALSE),
-             order_count = as.integer(order_count),
+    lag_df_orders <- lag_df_orders %>%
+      mutate(order_count = as.integer(order_count),
              Orders_lag1 = as.integer(Orders_lag1))
     
     # Updates forecast_results
@@ -640,7 +623,7 @@ forecast_results <- generate_forecast(min_rmse_model, actual_orders_data, lag_df
 forecast_results %>%
   plot_modeltime_forecast(.interactive = FALSE)
 
-# Takes forecasted data and joins it to the original orders data
+# Takes forecasted data and joins it to calls data
 df_orders_variable <- rbind(
   df_orders %>% 
     select(Date,order_count) %>%
@@ -655,12 +638,11 @@ df_orders_variable <- rbind(
            ".conf_lo_orders" = ".conf_lo",
            ".conf_hi_orders" = ".conf_hi") %>%
     mutate(Date = ymd(Date)) %>%
-    select(-.model_desc) %>%
+    select(-.model_dePromo_2) %>%
     select(Date,order_count,.conf_lo_orders,.conf_hi_orders)
   ) %>%
   mutate(order_count = as.integer(order_count))
 
-# Joins the orders_count data to the calls df
 df_calls <- left_join(df_calls %>%
                         filter(Date >= min(df_orders_variable$Date)),
                       df_orders_variable %>%
@@ -713,7 +695,7 @@ rm(detrended_calls,stl_decomposition,trend_component)
 ```
 
 ```{r}
-# Checks correlations
+# Checks coorelations
 df_calls %>%
   drop_na() %>%
   select(-Date, -Day) %>%
@@ -723,31 +705,14 @@ df_calls %>%
 
 ```{r}
 # Prepares data splits
+# Removes holiday and weekends
 lag_df_calls <- df_calls %>%
   arrange(Date) %>%
   filter(Date <= (Sys.Date() + days(90))) %>% # Only shows data 3 months from the date the code is ran
   mutate(Calls_lag1 = lag(Calls,1)) %>% 
   filter(Date > "2020-01-06") 
 
-# Weekly lag removed as it lowered machine learning metrics
-
-###########################################################
-
-#week_lag <- df_calls %>%
-#  select(Date,Calls) %>%
-#  mutate(next_week = Date + days(7)) %>%
-#  filter(next_week >= "2019-01-01") %>%
-#  select(next_week,Calls) %>%
-#  rename("Calls_lag_week" = "Calls")
-
-#lag_df_calls <- left_join(lag_df_calls,week_lag, by = c("Date" = "next_week")) %>%
-#  filter(Date > "2019-01-10") %>%
-#  mutate(Calls_lag_week = ifelse(Calls_lag_week == 0, NA, Calls_lag_week),
-#         Calls_lag_week = na.approx(Calls_lag_week, na.rm = FALSE)) 
-
-###########################################################
-
-# Splits data
+# Tries model without lag due to weekend/holidays
 Splits <- initial_time_split(lag_df_calls %>%
                                drop_na(), prop = 0.85)
 
@@ -767,14 +732,12 @@ recipe_spec_2 <- recipe(Calls ~ ., training(Splits)) %>%
   step_timeseries_signature(Date) %>%
   step_fourier(Date, period = 12, K = 2) %>%
   step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
-  # step_zv(all_predictors()) %>%
   step_dummy(all_nominal_predictors(), one_hot = TRUE) 
 
 recipe_spec_3 <- recipe(Calls ~ ., training(Splits)) %>%
   step_timeseries_signature(Date) %>%
   step_fourier(Date, period = 12, K = 3) %>%
   step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
-  # step_zv(all_predictors()) %>%
   step_dummy(all_nominal_predictors(), one_hot = TRUE)
 
 ###########################
@@ -868,12 +831,6 @@ fit_arima_boosted_2 <- workflow() %>%
 
 ###########################
 ### Non ML Moels
-# Exponential Smoothing
-fit_ets_2 <- workflow() %>%
-  add_model(exp_smoothing() %>% set_engine("ets")) %>%
-  add_recipe(recipe_spec_2) %>%
-  fit(training(Splits))
-
 # Prophet
 fit_prophet_2 <- workflow() %>%
   add_model(prophet_reg() %>% set_engine("prophet")) %>%
@@ -920,12 +877,6 @@ fit_arima_boosted_3 <- workflow() %>%
 
 ###########################
 ### Non ML Moels
-# Exponential Smoothing
-fit_ets_3 <- workflow() %>%
-  add_model(exp_smoothing() %>% set_engine("ets")) %>%
-  add_recipe(recipe_spec_3) %>%
-  fit(training(Splits))
-
 # Prophet
 fit_prophet_3 <- workflow() %>%
   add_model(prophet_reg() %>% set_engine("prophet")) %>%
@@ -953,8 +904,6 @@ models_tbl <-
     fit_arima_boosted_2,
     fit_arima_boosted_3,
     fit_ets,
-    fit_ets_2,
-    fit_ets_3,
     fit_prophet,
     fit_prophet_2,
     fit_prophet_3
@@ -978,8 +927,6 @@ rm(
     fit_arima_boosted_2,
     fit_arima_boosted_3,
     fit_ets,
-    fit_ets_2,
-    fit_ets_3,
     fit_prophet,
     fit_prophet_2,
     fit_prophet_3,
@@ -994,7 +941,6 @@ calibration_table <- models_tbl %>%
 ```
 
 ```{r}
-# Plots models
 calibration_table %>%
   modeltime_forecast(
     new_data = testing(Splits),
@@ -1023,7 +969,7 @@ min_rmse_model <- calibration_table %>%
   pull()
 
 #####
-# Forecast
+# Luke test forecast
 #####
 
 actual_call_data <- lag_df_calls %>%
@@ -1033,8 +979,9 @@ new_data <- lag_df_calls %>%
   filter(is.na(Calls)) %>%
   filter(!(is.na(Calls_lag1)))
 
-# Defines how many days out you want to forecast (60 = 60 days)
-forecast_horizon <- 60
+#Luke's Forecast
+# Defines how many months out you want to filter (60 = 60 days)
+forecast_horizon <- 49
 
 generate_forecast <- function(min_rmse_model, actual_call_data, lag_df_calls, 
                               new_data, forecast_horizon) {
@@ -1048,10 +995,10 @@ generate_forecast <- function(min_rmse_model, actual_call_data, lag_df_calls,
         .conf_lo = NA,
         .conf_hi = NA,
         .key = "actual",
-        .model_desc = "ACTUAL",
+        .model_dePromo_2 = "ACTUAL",
         .model_id = NA
     ) %>%
-    select(.index, .value, .conf_lo, .conf_hi, .key, .model_desc, .model_id)
+    select(.index, .value, .conf_lo, .conf_hi, .key, .model_dePromo_2, .model_id)
   
   lag_df_calls <- lag_df_calls
   
@@ -1103,9 +1050,9 @@ generate_forecast <- function(min_rmse_model, actual_call_data, lag_df_calls,
       .conf_lo = forecasted_lo,
       .conf_hi = forecasted_hi,
       .key = "prediction",
-      .model_desc = calibration_table %>%
+      .model_dePromo_2 = calibration_table %>%
         filter(.model_id %in% min_rmse_model) %>%
-        pull(.model_desc),
+        pull(.model_dePromo_2),
       .model_id = min_rmse_model
     )
     
@@ -1116,25 +1063,7 @@ generate_forecast <- function(min_rmse_model, actual_call_data, lag_df_calls,
       mutate(
         Calls = if_else(Date == next_date, forecasted_value, Calls),
         Calls_lag1 = lag(Calls,1)
-      ) #%>%
-      #select(-Calls_lag_week)
-    
-    # Week lag previously removed
-    
-    ###########################################################
-    
-    # Adds week lag variable
-    #week_lag <- lag_df_calls %>%
-      #select(Date,Calls) %>%
-      #mutate(next_week = Date + days(7)) %>%
-      #select(next_week, Calls) %>%
-      #rename("Calls_lag_week" = "Calls")
-    
-    #lag_df_calls <- left_join(lag_df_calls,week_lag, by = c("Date" = "next_week")) %>%
-      #mutate(Calls_lag_week = ifelse(Calls_lag_week == 0, NA, Calls_lag_week),
-             #Calls_lag_week = na.approx(Calls_lag_week, na.rm = FALSE))
-    
-    ###########################################################
+      )
     
     # Updates forecast_results
     forecast_results <- lag_df_calls %>%
@@ -1152,7 +1081,6 @@ generate_forecast <- function(min_rmse_model, actual_call_data, lag_df_calls,
 forecast_results <- generate_forecast(min_rmse_model, actual_call_data, lag_df_calls, 
                                       new_data, forecast_horizon)
 
-# Plots forecast results
 forecast_results %>%
   plot_modeltime_forecast(.interactive = FALSE)
 
@@ -1160,31 +1088,25 @@ model_name <- calibration_table %>%
   modeltime_accuracy() %>%
   filter(rsq < 0.97) %>%
   filter(rmse == min(rmse)) %>%
-  select(.model_desc) %>%
+  select(.model_dePromo_2) %>%
   pull()
 
-# Creates exportable df
 Export <- forecast_results %>%
   rename("Date" = ".index") %>%
   filter(.key %in% "prediction") %>%
   select(-.model_id, -.key) %>%
   rename("Incoming_Calls_Forecast"= ".value") %>%
   mutate(Date = ymd(Date)) %>%
-  select(-.model_desc) %>%
+  select(-.model_dePromo_2) %>%
   select(Date,Incoming_Calls_Forecast,.conf_lo,.conf_hi)
 
-# Adds orders forecast to the export file
 Export <- Export %>%
   left_join(df_orders_variable,
             by = "Date")
 
 
 write_csv(Export, "forecasts/Calls_Forecast.csv")
-
 ```
-
-
-
 
 
 
