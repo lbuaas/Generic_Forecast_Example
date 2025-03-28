@@ -1,0 +1,6163 @@
+---
+title: "KPI Forecast"
+author: "Luke Buaas"
+date: "2025-03-28"
+output: html_document
+---
+
+---
+title: "All_Forecasts"
+author: "Luke Buaas"
+date: "2024-08-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load Libraries
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(gridExtra)) install.packages("gridExtra", repos = "http://cran.us.r-project.org")
+if(!require(timetk)) install.packages("timetk", repos = "http://cran.us.r-project.org")
+if(!require(reshape2)) install.packages("reshape2", repos = "https://cran.us.r-project.org")
+if(!require(Boruta)) install.packages("Boruta", repos = "https://cran.us.r-project.org")
+if(!require(imputeTS)) install.packages("imputeTS", repos = "https://cran.us.r-project.org")
+if(!require(modeltime)) install.packages("modeltime", repos = "https://cran.us.r-project.org")
+if(!require(parsnip)) install.packages("parsnip", repos = "https://cran.us.r-project.org")
+if(!require(recipes)) install.packages("recipes", repos = "https://cran.us.r-project.org")
+if(!require(workflows)) install.packages("workflows", repos = "https://cran.us.r-project.org")
+if(!require(readxl)) install.packages("readxl", repos = "https://cran.us.r-project.org")
+if(!require(rsample)) install.packages("rsample", repos = "https://cran.us.r-project.org")
+if(!require(glmnet)) install.packages("glmnet", repos = "https://cran.us.r-project.org")
+```
+
+
+######################################################################################
+#
+# KPI_1
+#
+######################################################################################
+
+####
+# Cust_type_1
+###
+
+```{r}
+# Load in Raw Data
+df_KPI_1 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_1_Purchasers") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_1_Purchasers)
+
+names(df_KPI_1) <- c("Date", "KPI_1")
+
+df_promos <- read_xlsx("data/Forecast_Data.xlsx", sheet = "JPN_Promos") %>%
+  mutate(Date = ymd(Date),
+         Promo_1 = as.integer(Promo_1),
+         Promo_2 = as.integer(Promo_2),
+         Promo_3 = as.integer(Promo_3),
+         Promo_4 = as.integer(Promo_4),
+         Promo_5 = as.integer(Promo_12),
+         Promo_6 = as.integer(Promo_6),
+         Promo_7 = as.integer(Promo_7),
+         Promo_8 = as.integer(Promo_8),
+         Promo_9 = as.integer(Promo_9),
+         Promo_13 = as.integer(Promo_13),
+         Promo_10 = as.integer(Promo_10),
+         Promo_11 = as.integer(Promo_11),
+         Promo_12 = as.integer(Promo_12)) %>%
+  select(-Promo_12) %>%
+  select(-Promo_12)
+
+###################################################################
+
+df_KPI_1 <- left_join(df_KPI_1, df_promos, by = "Date")
+
+head(df_KPI_1)
+```
+
+```{r}
+df_KPI_1 %>%
+  ggplot(aes(Date, KPI_1)) +
+  geom_line() + 
+  geom_point()+
+  geom_smooth() +
+  labs(title = "KPI_1 Purchasers - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+```
+
+Detrends Data to check for seasonality
+```{r}
+# STL Decomposition
+detrended_KPI_1 <- df_KPI_1
+stl_decomposition <- stl(ts(detrended_KPI_1$KPI_1, frequency = 12), s.window = "periodic")
+trend_component <- stl_decomposition$time.series[, "trend"]
+detrended_KPI_1$detrended_stl <- detrended_KPI_1$KPI_1 - trend_component
+
+# Visualize
+ggplot(detrended_KPI_1, aes(Date, detrended_stl)) +
+  geom_line() + 
+  geom_point() +
+  geom_smooth() +
+  labs(title = "STL Detrended KPI_1 Purchasers - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+
+# Plot ACF (Autocorrelation) and PACF (Partial Autocorrelation) with more lags
+acf(detrended_KPI_1$detrended_stl, lag.max = nrow(detrended_KPI_1), xlab="Lag (years)")
+pacf(detrended_KPI_1$detrended_stl, lag.max = nrow(detrended_KPI_1), xlab="Lag (years)")
+
+rm(detrended_KPI_1,stl_decomposition,trend_component)
+```
+
+
+```{r}
+df_KPI_1 %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+Data Preparation
+```{r}
+lag_df_KPI_1 <- df_KPI_1 %>%
+  arrange(Date) %>%
+  mutate(KPI_1_lag1 = lag(KPI_1, 1),
+         KPI_1_lag3 = lag(KPI_1, 3),
+         KPI_1_lag6 = lag(KPI_1, 6),          
+         KPI_1_lag9 = lag(KPI_1, 9),
+         KPI_1_lag12 = lag(KPI_1, 12)) %>% 
+  drop_na()
+
+Splits <- initial_time_split(lag_df_KPI_1, prop = 0.85)
+
+Splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, KPI_1,.interactive = TRUE)
+```
+
+Model Pre-Processing
+```{r}
+recipe_spec <- recipe(KPI_1 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_2 <- recipe(KPI_1 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 2) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_3 <- recipe(KPI_1 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 3) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+###########################
+# Recipe 1
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet <- workflow() %>%
+  add_model(fit_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 2
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_2 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_2 <- workflow() %>%
+  add_model(fit_glmnet_2) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_2<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_2 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_2 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_2 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets_2 <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet_2 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 3
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_3 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_3 <- workflow() %>%
+  add_model(fit_glmnet_3) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_3 <- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_3 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_3 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_3 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets_3 <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet_3 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+
+### Add fitted model to a Model Table
+models_tbl <-
+  modeltime_table(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_ets_2,
+    fit_ets_3,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3
+  )
+###########################
+
+rm(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_ets_2,
+    fit_ets_3,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3,
+    recipe_spec,
+    recipe_spec_2,
+    recipe_spec_3
+)
+
+### Calibration
+calibration_table <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(Splits))
+```
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(
+    new_data = testing(Splits),
+    actual_data = lag_df_KPI_1
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+```{r}
+dates <- KPI_1(df_KPI_1$Date)
+`%ni%` <- Negate(`%in%`)
+
+df_promos <- df_promos %>% 
+  select(Date, Promo_1, Promo_2, Promo_3, Promo_4, Promo_6, Promo_7, Promo_8, Promo_9, Promo_13, Promo_10, Promo_5,Promo_11) #%>%
+  #filter(Date %ni% dates)
+
+df_promos <- recipe(Promo_5 ~ ., df_promos) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(df_promos)
+```
+
+
+```{r}
+# Finds the min RMSE model that is not overfitting
+min_rmse_model <- calibration_table %>%
+  modeltime_accuracy() %>%
+  filter(rsq < 0.97) %>%
+  filter(rmse == min(rmse)) %>%
+  select(.model_id) %>%
+  pull()
+
+#####
+# Luke test forecast
+#####
+
+df_combined <- left_join(df_promos, 
+                         df_KPI_1 %>% select(Date,KPI_1), 
+                         by = "Date") %>% 
+  arrange(Date)
+
+df_combined <- df_combined  %>%
+  mutate(KPI_1_lag1 = lag(KPI_1, 1),
+         KPI_1_lag3 = lag(KPI_1, 3),
+         KPI_1_lag6 = lag(KPI_1, 6),          
+         KPI_1_lag9 = lag(KPI_1, 9),
+         KPI_1_lag12 = lag(KPI_1, 12)) %>%
+  filter(!(Date < "2020-01-01"))
+
+actual_KPI_1_data <- df_combined %>%
+  filter(!(is.na(KPI_1)))
+
+new_data <- df_combined %>%
+  filter(is.na(KPI_1)) %>%
+  select(-KPI_1) %>%
+  filter(!(is.na(KPI_1_lag1)))
+
+# Defines how many months out you Cust_type_1nt to filter (6 = 6 months)
+forecast_horizon <- 10
+
+generate_forecast <- function(min_rmse_model, actual_KPI_1_data, df_combined, new_data, forecast_horizon) {
+  
+  forecast_results <- actual_KPI_1_data
+  
+  modeltime_actual_data_format <- actual_KPI_1_data %>% 
+      mutate(
+        .index = Date,
+        .value = KPI_1,
+        .conf_lo = NA,
+        .conf_hi = NA,
+        .key = "actual",
+        .model_desc = "ACTUAL",
+        .model_id = NA
+    ) %>%
+    select(.index, .value, .conf_lo, .conf_hi, .key, .model_desc, .model_id)
+  
+  df_combined <- df_combined %>%
+    select(Date,KPI_1,Promo_1,Promo_2,Promo_3,Promo_4,Promo_6,Promo_7,Promo_8,Promo_9,Promo_13,Promo_10,Promo_11,Promo_5,
+           KPI_1_lag1,KPI_1_lag3,KPI_1_lag6,KPI_1_lag9,KPI_1_lag12)
+  
+  for (i in 1:forecast_horizon) {
+    forecast <- calibration_table %>%
+      filter(.model_id %in% min_rmse_model) %>%
+      modeltime_refit(df_combined %>%
+                        filter(!is.na(KPI_1)) %>% # Remove NAs in KPI_1
+                        filter(!is.na(KPI_1_lag1)) %>% # Remove NAs in KPI_1_lag1
+                        filter(!is.na(KPI_1_lag3)) %>%
+                        filter(!is.na(KPI_1_lag6)) %>%
+                        filter(!is.na(KPI_1_lag12))
+                      ) %>%
+      modeltime_forecast(
+        new_data = new_data,
+        actual_data = forecast_results
+      )
+    
+    # Extract the forecasted value
+    forecasted_value <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .value) %>%
+      slice_tail(n = 1) %>%
+      pull(.value)
+    
+    # Extract the .conf_lo value
+    forecasted_lo <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_lo) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_lo)
+    
+    # Extract the .conf_hi value
+    forecasted_hi <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_hi) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_hi)
+    
+    # Add the forecasted value to the results
+    next_date <- max(forecast_results$Date) + months(1)
+    next_row <- data.frame(Date = next_date,
+                           KPI_1 = forecasted_value,
+                           KPI_1_lag1 = NA,
+                           KPI_1_lag3 = NA,
+                           KPI_1_lag6 = NA,
+                           KPI_1_lag12 = NA)
+    
+    forecast_results <- bind_rows(forecast_results, next_row)
+    
+    #Creates a separate forecast table in the Modeltime format
+    Luke_forecast <- data.frame(
+      .index = next_date,
+      .value = forecasted_value,
+      .conf_lo = forecasted_lo,
+      .conf_hi = forecasted_hi,
+      .key = "prediction",
+      .model_desc = calibration_table %>%
+        filter(.model_id %in% min_rmse_model) %>%
+        pull(.model_desc),
+      .model_id = min_rmse_model
+    )
+    
+    modeltime_actual_data_format <- bind_rows(modeltime_actual_data_format,Luke_forecast)
+    
+    # Update lag_df_KPI_1 for next iteration
+    df_combined <- df_combined %>%
+      mutate(
+        KPI_1 = if_else(Date == next_date, forecasted_value, KPI_1),
+        KPI_1_lag1 = lag(KPI_1, 1),
+        KPI_1_lag3 = lag(KPI_1, 3),
+        KPI_1_lag6 = lag(KPI_1, 6),          
+        KPI_1_lag9 = lag(KPI_1, 9),
+        KPI_1_lag12 = lag(KPI_1, 12)
+      )
+    
+    # Updates forecast_results
+    forecast_results <- df_combined %>% 
+      filter(!(is.na(KPI_1)))
+    
+    # Update new_data for the next iteration
+    new_data <- df_combined %>%
+      filter(is.na(KPI_1)) %>%
+      select(-KPI_1) %>%
+      filter(!(is.na(KPI_1_lag1)))
+  }
+  
+  return(modeltime_actual_data_format)
+}
+
+# Generates forecast
+forecast_results <- generate_forecast(min_rmse_model, actual_KPI_1_data, df_combined, new_data, forecast_horizon)
+
+forecast_results %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+
+Export <- forecast_results %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export, "forecasts/Cust_type_1_KPI_1Purchasers_forecast.csv")
+```
+
+###
+# Cust_type_2
+###
+
+
+```{r}
+# Load in Raw Data
+df_KPI_1 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_1_Purchasers") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_2_Purchasers)
+
+names(df_KPI_1) <- c("Date", "KPI_1")
+
+df_promos <- read_xlsx("data/Forecast_Data.xlsx", sheet = "JPN_Promos") %>%
+  mutate(Date = ymd(Date),
+         Promo_1 = as.integer(Promo_1),
+         Promo_2 = as.integer(Promo_2),
+         Promo_3 = as.integer(Promo_3),
+         Promo_4 = as.integer(Promo_4),
+         Promo_5 = as.integer(Promo_12),
+         Promo_6 = as.integer(Promo_6),
+         Promo_7 = as.integer(Promo_7),
+         Promo_8 = as.integer(Promo_8),
+         Promo_9 = as.integer(Promo_9),
+         Promo_13 = as.integer(Promo_13),
+         Promo_10 = as.integer(Promo_10),          
+         Promo_11 = as.integer(Promo_11),
+         Promo_12 = as.integer(Promo_12)) %>%
+  select(-Promo_12) %>%
+  select(-Promo_12)
+
+###################################################################
+
+df_KPI_1 <- left_join(df_KPI_1, df_promos, by = "Date")
+
+head(df_KPI_1)
+```
+
+```{r}
+df_KPI_1 %>%
+  ggplot(aes(Date, KPI_1)) +
+  geom_line() + 
+  geom_point()+
+  geom_smooth() +
+  labs(title = "KPI_1 Purchasers - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+```
+
+Detrends data
+```{r}
+# STL Decomposition
+detrended_KPI_1 <- df_KPI_1
+stl_decomposition <- stl(ts(detrended_KPI_1$KPI_1, frequency = 12), s.window = "periodic")
+trend_component <- stl_decomposition$time.series[, "trend"]
+detrended_KPI_1$detrended_stl <- detrended_KPI_1$KPI_1 - trend_component
+
+# Visualize
+ggplot(detrended_KPI_1, aes(Date, detrended_stl)) +
+  geom_line() + 
+  geom_point() +
+  geom_smooth() +
+  labs(title = "STL Detrended KPI_1 Purchasers - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+
+# Plot ACF (Autocorrelation) and PACF (Partial Autocorrelation) with more lags
+acf(detrended_KPI_1$detrended_stl, lag.max = nrow(detrended_KPI_1), xlab="Lag (years)")
+pacf(detrended_KPI_1$detrended_stl, lag.max = nrow(detrended_KPI_1), xlab="Lag (years)")
+
+rm(detrended_KPI_1,stl_decomposition,trend_component)
+```
+
+```{r}
+df_KPI_1 %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+Data Preparation
+```{r}
+lag_df_KPI_1 <- df_KPI_1 %>%
+  arrange(Date) %>%
+  mutate(KPI_1_lag1 = lag(KPI_1, 1),
+         KPI_1_lag3 = lag(KPI_1, 3),
+         KPI_1_lag6 = lag(KPI_1, 6),          
+         KPI_1_lag9 = lag(KPI_1, 9),
+         KPI_1_lag12 = lag(KPI_1, 12)) %>%  
+  drop_na()
+
+Splits <- initial_time_split(lag_df_KPI_1, prop = 0.85)
+
+Splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, KPI_1,.interactive = TRUE)
+```
+
+
+Model Pre-Processing
+```{r}
+recipe_spec <- recipe(KPI_1 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_2 <- recipe(KPI_1 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 2) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_3 <- recipe(KPI_1 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 3) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+###########################
+# Recipe 1
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet <- workflow() %>%
+  add_model(fit_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 2
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_2 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_2 <- workflow() %>%
+  add_model(fit_glmnet_2) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_2<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_2 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_2 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_2 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets_2 <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet_2 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 3
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_3 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_3 <- workflow() %>%
+  add_model(fit_glmnet_3) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_3 <- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_3 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_3 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_3 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets_3 <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet_3 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+
+### Add fitted model to a Model Table
+models_tbl <-
+  modeltime_table(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_ets_2,
+    fit_ets_3,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3
+  )
+###########################
+
+rm(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_ets_2,
+    fit_ets_3,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3,
+    recipe_spec,
+    recipe_spec_2,
+    recipe_spec_3
+)
+
+### Calibration
+calibration_table <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(Splits))
+```
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(
+    new_data = testing(Splits),
+    actual_data = lag_df_KPI_1
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+```{r}
+dates <- KPI_1(df_KPI_1$Date)
+`%ni%` <- Negate(`%in%`)
+
+df_promos <- df_promos %>% 
+  select(Date, Promo_1, Promo_2, Promo_3, Promo_4, Promo_6, Promo_7, Promo_8, Promo_9, Promo_13, Promo_10, Promo_5,Promo_11) #%>%
+  #filter(Date %ni% dates)
+
+df_promos <- recipe(Promo_5 ~ ., df_promos) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(df_promos)
+```
+
+
+```{r}
+# Finds the min RMSE model that is not overfitting
+min_rmse_model <- calibration_table %>%
+  modeltime_accuracy() %>%
+  filter(rsq < 0.97) %>%
+  filter(rmse == min(rmse)) %>%
+  select(.model_id) %>%
+  pull()
+
+#####
+# Luke test forecast
+#####
+
+df_combined <- left_join(df_promos, 
+                         df_KPI_1 %>% select(Date,KPI_1), 
+                         by = "Date") %>% 
+  arrange(Date)
+
+df_combined <- df_combined  %>%
+  mutate(KPI_1_lag1 = lag(KPI_1, 1),
+         KPI_1_lag3 = lag(KPI_1, 3),
+         KPI_1_lag6 = lag(KPI_1, 6),          
+         KPI_1_lag9 = lag(KPI_1, 9),
+         KPI_1_lag12 = lag(KPI_1, 12)) %>%
+  filter(!(Date < "2020-01-01"))
+
+actual_KPI_1_data <- df_combined %>%
+  filter(!(is.na(KPI_1)))
+
+new_data <- df_combined %>%
+  filter(is.na(KPI_1)) %>%
+  select(-KPI_1) %>%
+  filter(!(is.na(KPI_1_lag1)))
+
+# Defines how many months out you Cust_type_1nt to filter (6 = 6 months)
+forecast_horizon <- 10
+
+generate_forecast <- function(min_rmse_model, actual_KPI_1_data, df_combined, new_data, forecast_horizon) {
+  
+  forecast_results <- actual_KPI_1_data
+  
+  modeltime_actual_data_format <- actual_KPI_1_data %>% 
+      mutate(
+        .index = Date,
+        .value = KPI_1,
+        .conf_lo = NA,
+        .conf_hi = NA,
+        .key = "actual",
+        .model_desc = "ACTUAL",
+        .model_id = NA
+    ) %>%
+    select(.index, .value, .conf_lo, .conf_hi, .key, .model_desc, .model_id)
+  
+  df_combined <- df_combined %>%
+    select(Date,KPI_1,Promo_1,Promo_2,Promo_3,Promo_4,Promo_6,Promo_7,Promo_8,Promo_9,Promo_13,Promo_10,Promo_11,Promo_5,
+           KPI_1_lag1,KPI_1_lag3,KPI_1_lag6,KPI_1_lag9,KPI_1_lag12)
+  
+  for (i in 1:forecast_horizon) {
+    forecast <- calibration_table %>%
+      filter(.model_id %in% min_rmse_model) %>%
+      modeltime_refit(df_combined %>%
+                        filter(!is.na(KPI_1)) %>% # Remove NAs in KPI_1
+                        filter(!is.na(KPI_1_lag1)) %>% # Remove NAs in KPI_1_lag1
+                        filter(!is.na(KPI_1_lag3)) %>%
+                        filter(!is.na(KPI_1_lag6)) %>%
+                        filter(!is.na(KPI_1_lag12))
+                      ) %>%
+      modeltime_forecast(
+        new_data = new_data,
+        actual_data = forecast_results
+      )
+    
+    # Extract the forecasted value
+    forecasted_value <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .value) %>%
+      slice_tail(n = 1) %>%
+      pull(.value)
+    
+    # Extract the .conf_lo value
+    forecasted_lo <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_lo) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_lo)
+    
+    # Extract the .conf_hi value
+    forecasted_hi <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_hi) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_hi)
+    
+    # Add the forecasted value to the results
+    next_date <- max(forecast_results$Date) + months(1)
+    next_row <- data.frame(Date = next_date,
+                           KPI_1 = forecasted_value,
+                           KPI_1_lag1 = NA,
+                           KPI_1_lag3 = NA,
+                           KPI_1_lag6 = NA,
+                           KPI_1_lag12 = NA)
+    
+    forecast_results <- bind_rows(forecast_results, next_row)
+    
+    #Creates a separate forecast table in the Modeltime format
+    Luke_forecast <- data.frame(
+      .index = next_date,
+      .value = forecasted_value,
+      .conf_lo = forecasted_lo,
+      .conf_hi = forecasted_hi,
+      .key = "prediction",
+      .model_desc = calibration_table %>%
+        filter(.model_id %in% min_rmse_model) %>%
+        pull(.model_desc),
+      .model_id = min_rmse_model
+    )
+    
+    modeltime_actual_data_format <- bind_rows(modeltime_actual_data_format,Luke_forecast)
+    
+    # Update lag_df_KPI_1 for next iteration
+    df_combined <- df_combined %>%
+      mutate(
+        KPI_1 = if_else(Date == next_date, forecasted_value, KPI_1),
+        KPI_1_lag1 = lag(KPI_1, 1),
+        KPI_1_lag3 = lag(KPI_1, 3),
+        KPI_1_lag6 = lag(KPI_1, 6),          
+        KPI_1_lag9 = lag(KPI_1, 9),
+        KPI_1_lag12 = lag(KPI_1, 12))
+    
+    # Updates forecast_results
+    forecast_results <- df_combined %>% 
+      filter(!(is.na(KPI_1)))
+    
+    # Update new_data for the next iteration
+    new_data <- df_combined %>%
+      filter(is.na(KPI_1)) %>%
+      select(-KPI_1) %>%
+      filter(!(is.na(KPI_1_lag1)))
+  }
+  
+  return(modeltime_actual_data_format)
+}
+
+# Generates forecast
+forecast_results <- generate_forecast(min_rmse_model, actual_KPI_1_data, df_combined, new_data, forecast_horizon)
+
+forecast_results %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+
+Export <- forecast_results %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export, "forecasts/Cust_type_2_KPI_1Purchasers_forecast.csv")
+```
+
+
+###
+# Actual
+###
+
+
+```{r}
+# Load in Raw Data
+df_KPI_1 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_1_Purchasers") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, KPI_1_Purchasers)
+
+names(df_KPI_1) <- c("Date", "KPI_1")
+
+df_promos <- read_xlsx("data/Forecast_Data.xlsx", sheet = "JPN_Promos") %>%
+  mutate(Date = ymd(Date),
+         Promo_1 = as.integer(Promo_1),
+         Promo_2 = as.integer(Promo_2),
+         Promo_4 = as.integer(Promo_4),
+         Promo_5 = as.integer(Promo_12),
+         Promo_6 = as.integer(Promo_6),
+         Promo_7 = as.integer(Promo_7),
+         Promo_3 = as.integer(Promo_3),
+         Promo_8 = as.integer(Promo_8),
+         Promo_9 = as.integer(Promo_9),
+         Promo_13 = as.integer(Promo_13),
+         Promo_10 = as.integer(Promo_10),          
+         Promo_11 = as.integer(Promo_11),
+         Promo_12 = as.integer(Promo_12))  %>%
+  select(-Promo_12) %>%
+  select(-Promo_12)
+
+###################################################################
+# READS Cust_type_1 DATA.
+###################################################################
+df_Cust_type_1 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_1_Purchasers") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_1_Purchasers)
+
+names(df_Cust_type_1) <- c("Date", "Cust_type_1")
+
+df_Cust_type_1_Forecast <- read_csv("forecasts/Cust_type_1_KPI_1Purchasers_forecast.csv")
+
+# df_KPI_1_Forecast$.index <- mdy(df_KPI_1_Forecast$.index)
+
+df_Cust_type_1_Forecast <- df_Cust_type_1_Forecast[,c(1,4)]
+
+names(df_Cust_type_1_Forecast) <- c("Date", "Cust_type_1")
+
+df_Cust_type_1 <- rbind(df_Cust_type_1, df_Cust_type_1_Forecast)
+
+rm(df_Cust_type_1_Forecast)
+
+
+###################################################################
+# READS Cust_type_2 DATA. NOT NEEDED
+###################################################################
+df_Cust_type_2 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_1_Purchasers") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_2_Purchasers)
+
+names(df_Cust_type_2) <- c("Date", "Cust_type_2")
+
+df_Cust_type_2_Forecast <- read_csv("forecasts/Cust_type_2_KPI_1Purchasers_forecast.csv")
+
+# df_KPI_1_Forecast$.index <- mdy(df_KPI_1_Forecast$.index)
+
+df_Cust_type_2_Forecast <- df_Cust_type_2_Forecast[,c(1,4)]
+
+names(df_Cust_type_2_Forecast) <- c("Date", "Cust_type_2")
+
+df_Cust_type_2 <- rbind(df_Cust_type_2, df_Cust_type_2_Forecast)
+
+rm(df_Cust_type_2_Forecast)
+###################################################################
+
+df_promos <- left_join(df_promos, df_Cust_type_1, by = "Date")
+df_promos <- left_join(df_promos, df_Cust_type_2, by = "Date")
+df_KPI_1 <- left_join(df_KPI_1, df_promos, by = "Date")
+
+head(df_KPI_1)
+```
+
+```{r}
+df_KPI_1 %>%
+  ggplot(aes(Date, KPI_1)) +
+  geom_line() + 
+  geom_point()+
+  geom_smooth() +
+  labs(title = "KPI_1 Purchasers - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+```
+
+detrends data
+```{r}
+# STL Decomposition
+detrended_KPI_1 <- df_KPI_1
+stl_decomposition <- stl(ts(detrended_KPI_1$KPI_1, frequency = 12), s.window = "periodic")
+trend_component <- stl_decomposition$time.series[, "trend"]
+detrended_KPI_1$detrended_stl <- detrended_KPI_1$KPI_1 - trend_component
+
+# Visualize
+ggplot(detrended_KPI_1, aes(Date, detrended_stl)) +
+  geom_line() + 
+  geom_point() +
+  geom_smooth() +
+  labs(title = "STL Detrended KPI_1 Purchasers - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+
+# Plot ACF (Autocorrelation) and PACF (Partial Autocorrelation) with more lags
+acf(detrended_KPI_1$detrended_stl, lag.max = nrow(detrended_KPI_1), xlab="Lag (years)")
+pacf(detrended_KPI_1$detrended_stl, lag.max = nrow(detrended_KPI_1), xlab="Lag (years)")
+
+rm(detrended_KPI_1,stl_decomposition,trend_component)
+```
+
+
+```{r}
+df_KPI_1 %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+Data Preparation
+```{r}
+lag_df_KPI_1 <- df_KPI_1 %>%
+  arrange(Date) %>%
+  mutate(KPI_1_lag1 = lag(KPI_1, 1),
+         KPI_1_lag3 = lag(KPI_1, 3),
+         KPI_1_lag6 = lag(KPI_1, 6),          
+         KPI_1_lag9 = lag(KPI_1, 9),
+         KPI_1_lag12 = lag(KPI_1, 12)) %>%
+  filter(!(Date < "2020-01-01"))
+
+Splits <- initial_time_split(lag_df_KPI_1, prop = 0.85)
+
+Splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, KPI_1,.interactive = TRUE)
+```
+
+Model Pre-Processing
+```{r}
+recipe_spec <- recipe(KPI_1 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_2 <- recipe(KPI_1 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 2) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_3 <- recipe(KPI_1 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 3) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+###########################
+# Recipe 1
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet <- workflow() %>%
+  add_model(fit_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 2
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_2 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_2 <- workflow() %>%
+  add_model(fit_glmnet_2) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_2<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_2 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_2 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_2 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Prophet
+fit_prophet_2 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 3
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_3 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_3 <- workflow() %>%
+  add_model(fit_glmnet_3) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_3 <- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_3 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_3 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_3 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+
+# Prophet
+fit_prophet_3 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+
+### Add fitted model to a Model Table
+models_tbl <-
+  modeltime_table(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3
+  )
+###########################
+
+rm(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3,
+    recipe_spec,
+    recipe_spec_2,
+    recipe_spec_3
+)
+
+### Calibration
+calibration_table <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(Splits))
+```
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(
+    new_data = testing(Splits),
+    actual_data = lag_df_KPI_1
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+
+```{r}
+dates <- KPI_1(df_KPI_1$Date)
+`%ni%` <- Negate(`%in%`)
+
+df_promos <- df_promos %>% 
+  select(Date, Promo_1, Promo_2, Promo_3, Promo_4, Promo_6, Promo_7, Promo_8, Promo_9, Promo_13, Promo_10, Promo_5,Promo_11,Cust_type_1, Cust_type_2)#, Promo_12) #%>%
+  #filter(Date %ni% dates)
+
+df_promos <- recipe(Promo_5 ~ ., df_promos) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(df_promos)
+```
+
+
+```{r}
+# Finds the min RMSE model that is not overfitting
+min_rmse_model <- calibration_table %>%
+  modeltime_accuracy() %>%
+  filter(rsq < 0.97) %>%
+  filter(rmse == min(rmse)) %>%
+  select(.model_id) %>%
+  pull()
+
+#####
+# Luke test forecast
+#####
+
+df_combined <- left_join(df_promos, 
+                         df_KPI_1 %>% select(Date,KPI_1), 
+                         by = "Date") %>% 
+  arrange(Date)
+
+df_combined <- df_combined  %>%
+  mutate(KPI_1_lag1 = lag(KPI_1, 1),
+         KPI_1_lag3 = lag(KPI_1, 3),
+         KPI_1_lag6 = lag(KPI_1, 6),          
+         KPI_1_lag9 = lag(KPI_1, 9),
+         KPI_1_lag12 = lag(KPI_1, 12)) %>%
+  filter(!(Date < "2020-01-01"))
+
+actual_KPI_1_data <- df_combined %>%
+  filter(!(is.na(KPI_1)))
+
+new_data <- df_combined %>%
+  filter(is.na(KPI_1)) %>%
+  select(-KPI_1) %>%
+  filter(!(is.na(KPI_1_lag1)))
+
+# Defines how many months out you Cust_type_1nt to filter (6 = 6 months)
+forecast_horizon <- 10
+
+generate_forecast <- function(min_rmse_model, actual_KPI_1_data, df_combined, new_data, forecast_horizon) {
+  
+  forecast_results <- actual_KPI_1_data
+  
+  modeltime_actual_data_format <- actual_KPI_1_data %>% 
+      mutate(
+        .index = Date,
+        .value = KPI_1,
+        .conf_lo = NA,
+        .conf_hi = NA,
+        .key = "actual",
+        .model_desc = "ACTUAL",
+        .model_id = NA
+    ) %>%
+    select(.index, .value, .conf_lo, .conf_hi, .key, .model_desc, .model_id)
+  
+  df_combined <- df_combined %>%
+    select(Date,KPI_1,Promo_1,Promo_2,Promo_3,Promo_4,Promo_6,Promo_7,Promo_8,Promo_9,Promo_13,Promo_10,Promo_11,Promo_5,
+           KPI_1_lag1,KPI_1_lag3,KPI_1_lag6,KPI_1_lag9,KPI_1_lag12,Cust_type_1,Cust_type_2)#,Promo_12)
+  
+  for (i in 1:forecast_horizon) {
+    forecast <- calibration_table %>%
+      filter(.model_id %in% min_rmse_model) %>%
+      modeltime_refit(df_combined %>%
+                        filter(!is.na(KPI_1)) %>% # Remove NAs in KPI_1
+                        filter(!is.na(KPI_1_lag1)) %>% # Remove NAs in KPI_1_lag1
+                        filter(!is.na(KPI_1_lag3)) %>%
+                        filter(!is.na(KPI_1_lag6)) %>%
+                        filter(!is.na(KPI_1_lag12))
+                      ) %>%
+      modeltime_forecast(
+        new_data = new_data,
+        actual_data = forecast_results
+      )
+    
+    # Extract the forecasted value
+    forecasted_value <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .value) %>%
+      slice_tail(n = 1) %>%
+      pull(.value)
+    
+    # Extract the .conf_lo value
+    forecasted_lo <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_lo) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_lo)
+    
+    # Extract the .conf_hi value
+    forecasted_hi <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_hi) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_hi)
+    
+    # Add the forecasted value to the results
+    next_date <- max(forecast_results$Date) + months(1)
+    next_row <- data.frame(Date = next_date,
+                           KPI_1 = forecasted_value,
+                           KPI_1_lag1 = NA,
+                           KPI_1_lag3 = NA,
+                           KPI_1_lag6 = NA,
+                           KPI_1_lag12 = NA)
+    
+    forecast_results <- bind_rows(forecast_results, next_row)
+    
+    #Creates a separate forecast table in the Modeltime format
+    Luke_forecast <- data.frame(
+      .index = next_date,
+      .value = forecasted_value,
+      .conf_lo = forecasted_lo,
+      .conf_hi = forecasted_hi,
+      .key = "prediction",
+      .model_desc = calibration_table %>%
+        filter(.model_id %in% min_rmse_model) %>%
+        pull(.model_desc),
+      .model_id = min_rmse_model
+    )
+    
+    modeltime_actual_data_format <- bind_rows(modeltime_actual_data_format,Luke_forecast)
+    
+    # Update lag_df_KPI_1 for next iteration
+    df_combined <- df_combined %>%
+      mutate(
+        KPI_1 = if_else(Date == next_date, forecasted_value, KPI_1),
+        KPI_1_lag1 = lag(KPI_1, 1),
+        KPI_1_lag3 = lag(KPI_1, 3),
+        KPI_1_lag6 = lag(KPI_1, 6),          
+        KPI_1_lag9 = lag(KPI_1, 9),
+        KPI_1_lag12 = lag(KPI_1, 12)
+      )
+    
+    # Updates forecast_results
+    forecast_results <- df_combined %>% 
+      filter(!(is.na(KPI_1)))
+    
+    # Update new_data for the next iteration
+    new_data <- df_combined %>%
+      filter(is.na(KPI_1)) %>%
+      select(-KPI_1) %>%
+      filter(!(is.na(KPI_1_lag1)))
+  }
+  
+  return(modeltime_actual_data_format)
+}
+
+# Generates forecast
+forecast_results <- generate_forecast(min_rmse_model, actual_KPI_1_data, df_combined, new_data, forecast_horizon)
+
+forecast_results %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+
+Export <- forecast_results %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export, "forecasts/KPI_1Purchasers_forecast.csv")
+```
+
+
+######################################################################################
+#
+# SALES
+#
+######################################################################################
+
+
+###
+# Cust_type_1
+###
+
+
+```{r}
+# Load in Raw Dat
+df_sales <- read_xlsx("data/Forecast_Data.xlsx", sheet = "Native_Sales") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_1_Sales)
+
+names(df_sales) <- c("Date", "Sales")
+
+df_promos <- read_xlsx("data/Forecast_Data.xlsx", sheet = "JPN_Promos") %>%
+  mutate(Date = ymd(Date),
+         Promo_1 = as.integer(Promo_1),
+         Promo_2 = as.integer(Promo_2),
+         Promo_3 = as.integer(Promo_3),
+         Promo_4 = as.integer(Promo_4),
+         Promo_5 = as.integer(Promo_12),
+         Promo_6 = as.integer(Promo_6),
+         Promo_7 = as.integer(Promo_7),
+         Promo_8 = as.integer(Promo_8),
+         Promo_9 = as.integer(Promo_9),
+         Promo_13 = as.integer(Promo_13),
+         Promo_10 = as.integer(Promo_10),         
+         Promo_11 = as.integer(Promo_11),
+         Promo_12 = as.integer(Promo_12)) %>%
+  select(-Promo_12)
+
+#########################################
+
+df_KPI_1 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_1_Purchasers") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_1_Purchasers)
+
+names(df_KPI_1) <- c("Date", "KPI_1")
+
+df_KPI_1_Forecast <- read_csv("forecasts/Cust_type_1_KPI_1Purchasers_forecast.csv")
+
+df_KPI_1_Forecast <- df_KPI_1_Forecast[,c(1,4)]
+
+names(df_KPI_1_Forecast) <- c("Date", "KPI_1")
+
+df_KPI_1 <- rbind(df_KPI_1, df_KPI_1_Forecast)
+
+rm(df_KPI_1_Forecast)
+
+###################################################################
+
+df_promos <- left_join(df_promos, df_KPI_1, by = "Date")
+df_sales <- left_join(df_sales, df_promos, by = "Date")
+
+head(df_sales)
+```
+
+```{r}
+df_sales %>%
+  ggplot(aes(Date, Sales)) +
+  geom_line() + 
+  geom_point()+
+  geom_smooth() +
+  labs(title = "Native Sales - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+```
+
+detrends data
+```{r}
+# STL Decomposition
+detrended_sales <- df_sales
+stl_decomposition <- stl(ts(detrended_sales$Sales, frequency = 12), s.window = "periodic")
+trend_component <- stl_decomposition$time.series[, "trend"]
+detrended_sales$detrended_stl <- detrended_sales$Sales - trend_component
+
+# Visualize
+ggplot(detrended_sales, aes(Date, detrended_stl)) +
+  geom_line() + 
+  geom_point() +
+  geom_smooth() +
+  labs(title = "STL Detrended KPI_1 Purchasers - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+
+# Create a time series object for detrended_stl with the correct frequency and start period
+detrended_stl_ts <- ts(detrended_sales$detrended_stl, frequency = 12, start = c(year(min(detrended_sales$Date)), month(min(detrended_sales$Date))))
+
+# Plot ACF (Autocorrelation) and PACF (Partial Autocorrelation) with more lags
+acf(detrended_stl_ts, lag.max = nrow(detrended_sales), xlab="Lag (years)")
+pacf(detrended_stl_ts, lag.max = nrow(detrended_sales), xlab="Lag (years)")
+
+rm(detrended_sales,detrended_stl_ts,stl_decomposition,trend_component)
+```
+
+```{r}
+df_sales %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+Data Preparation
+```{r}
+lag_df_sales <- df_sales %>%
+  arrange(Date) %>%
+  mutate(Sales_lag1 = lag(Sales, 1),
+         Sales_lag3 = lag(Sales, 3),
+         Sales_lag6 = lag(Sales, 6),
+         Sales_lag9 = lag(Sales, 9),
+         Sales_lag12 = lag(Sales, 12)) %>% 
+  drop_na()
+
+Splits <- initial_time_split(lag_df_sales, prop = 0.85)
+
+Splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, Sales,.interactive = TRUE)
+```
+
+
+Model Pre-Processing
+```{r}
+recipe_spec <- recipe(Sales ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_2 <- recipe(Sales ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 2) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_3 <- recipe(Sales ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 3) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+###########################
+# Recipe 1
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet <- workflow() %>%
+  add_model(fit_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 2
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_2 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_2 <- workflow() %>%
+  add_model(fit_glmnet_2) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_2<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_2 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_2 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_2 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+
+# Prophet
+fit_prophet_2 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 3
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_3 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_3 <- workflow() %>%
+  add_model(fit_glmnet_3) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_3 <- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_3 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_3 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_3 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+
+# Prophet
+fit_prophet_3 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+
+### Add fitted model to a Model Table
+models_tbl <-
+  modeltime_table(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3
+  )
+###########################
+
+rm(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3,
+    recipe_spec,
+    recipe_spec_2,
+    recipe_spec_3
+)
+
+### Calibration
+calibration_table <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(Splits))
+```
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(
+    new_data = testing(Splits),
+    actual_data = lag_df_sales
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+
+```{r}
+dates <- KPI_1(df_sales$Date)
+`%ni%` <- Negate(`%in%`)
+
+df_promos <- df_promos %>% 
+  select(Date, Promo_1, Promo_2, Promo_3, Promo_4, Promo_6, Promo_7, Promo_8, Promo_9, Promo_13, Promo_10, Promo_5,Promo_11, KPI_1, Promo_12) #%>%
+  #filter(Date %ni% dates)
+
+df_promos <- recipe(KPI_1 ~ ., df_promos) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(df_promos)
+```
+
+
+```{r}
+# Finds the min RMSE model that is not overfitting
+min_rmse_model <- calibration_table %>%
+  modeltime_accuracy() %>%
+  filter(rsq < 0.97) %>%
+  filter(rmse == min(rmse)) %>%
+  select(.model_id) %>%
+  pull()
+
+#####
+# Luke test forecast
+#####
+
+df_combined <- left_join(df_promos, 
+                         df_sales %>% select(Date,Sales), 
+                         by = "Date") %>% 
+  arrange(Date)
+
+df_combined <- df_combined  %>%
+  mutate(Sales_lag1 = lag(Sales, 1),
+         Sales_lag3 = lag(Sales, 3),
+         Sales_lag6 = lag(Sales, 6),
+         Sales_lag9 = lag(Sales, 9),
+         Sales_lag12 = lag(Sales, 12)) %>%
+  filter(!(Date < "2020-01-01"))
+
+actual_sales_data <- df_combined %>%
+  filter(!(is.na(Sales)))
+
+new_data <- df_combined %>%
+  filter(is.na(Sales)) %>%
+  select(-Sales) %>%
+  filter(!(is.na(Sales_lag1)))
+
+# Defines how many months out you Cust_type_1nt to filter (6 = 6 months)
+forecast_horizon <- 10
+
+generate_forecast <- function(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon) {
+  
+  forecast_results <- actual_sales_data
+  
+  modeltime_actual_data_format <- actual_sales_data %>% 
+      mutate(
+        .index = Date,
+        .value = Sales,
+        .conf_lo = NA,
+        .conf_hi = NA,
+        .key = "actual",
+        .model_desc = "ACTUAL",
+        .model_id = NA
+    ) %>%
+    select(.index, .value, .conf_lo, .conf_hi, .key, .model_desc, .model_id)
+  
+  df_combined <- df_combined %>%
+    select(Date,Sales,KPI_1,Promo_1,Promo_2,Promo_3,Promo_4,Promo_6,Promo_7,Promo_8,Promo_9,Promo_13,Promo_10,Promo_11,Promo_5,
+           Promo_12,Sales_lag1,Sales_lag3,Sales_lag6,Sales_lag9,Sales_lag12)
+  
+  for (i in 1:forecast_horizon) {
+    forecast <- calibration_table %>%
+      filter(.model_id %in% min_rmse_model) %>%
+      modeltime_refit(df_combined %>%
+                        filter(!is.na(Sales)) %>% # Remove NAs in Sales
+                        filter(!is.na(Sales_lag1)) %>%  # Remove NAs in Sales_lag1
+                        filter(!is.na(Sales_lag3)) %>%
+                        filter(!is.na(Sales_lag6)) %>%
+                        filter(!is.na(Sales_lag9)) %>%
+                        filter(!is.na(Sales_lag12))
+                      ) %>%
+      modeltime_forecast(
+        new_data = new_data,
+        actual_data = forecast_results
+      )
+    
+    # Extract the forecasted value
+    forecasted_value <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .value) %>%
+      slice_tail(n = 1) %>%
+      pull(.value)
+    
+    # Extract the .conf_lo value
+    forecasted_lo <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_lo) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_lo)
+    
+    # Extract the .conf_hi value
+    forecasted_hi <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_hi) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_hi)
+    
+    # Add the forecasted value to the results
+    next_date <- max(forecast_results$Date) + months(1)
+    next_row <- data.frame(Date = next_date,
+                           Sales = forecasted_value,
+                           Sales_lag1 = NA,
+                           Sales_lag3 = NA,
+                           Sales_lag6 = NA,
+                           Sales_lag9 = NA,
+                           Sales_lag12 = NA)
+    
+    forecast_results <- bind_rows(forecast_results, next_row)
+    
+    #Creates a separate forecast table in the Modeltime format
+    Luke_forecast <- data.frame(
+      .index = next_date,
+      .value = forecasted_value,
+      .conf_lo = forecasted_lo,
+      .conf_hi = forecasted_hi,
+      .key = "prediction",
+      .model_desc = calibration_table %>%
+        filter(.model_id %in% min_rmse_model) %>%
+        pull(.model_desc),
+      .model_id = min_rmse_model
+    )
+    
+    modeltime_actual_data_format <- bind_rows(modeltime_actual_data_format,Luke_forecast)
+    
+    # Update lag_df_KPI_1 for next iteration
+    df_combined <- df_combined %>%
+      mutate(
+        Sales = if_else(Date == next_date, forecasted_value, Sales),
+        Sales_lag1 = lag(Sales, 1),
+        Sales_lag3 = lag(Sales, 3),
+        Sales_lag6 = lag(Sales, 6),
+        Sales_lag9 = lag(Sales, 9),
+        Sales_lag12 = lag(Sales, 12)
+      )
+    
+    # Updates forecast_results
+    forecast_results <- df_combined %>% 
+      filter(!(is.na(Sales)))
+    
+    # Update new_data for the next iteration
+    new_data <- df_combined %>%
+      filter(is.na(Sales)) %>%
+      select(-Sales) %>%
+      filter(!(is.na(Sales_lag1)))
+  }
+  
+  return(modeltime_actual_data_format)
+}
+
+# Generates forecast
+forecast_results <- generate_forecast(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon)
+
+forecast_results %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+
+Export <- forecast_results %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export, "forecasts/Cust_type_1_NativeSales_forecast.csv")
+```
+
+
+###
+# Cust_type_2
+###
+
+
+```{r}
+# Load in Raw Dat
+df_sales <- read_xlsx("data/Forecast_Data.xlsx", sheet = "Native_Sales") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_2_Sales)
+
+names(df_sales) <- c("Date", "Sales")
+
+df_promos <- read_xlsx("data/Forecast_Data.xlsx", sheet = "JPN_Promos") %>%
+  mutate(Date = ymd(Date),
+         Promo_1 = as.integer(Promo_1),
+         Promo_2 = as.integer(Promo_2),
+         Promo_3 = as.integer(Promo_3),
+         Promo_4 = as.integer(Promo_4),
+         Promo_5 = as.integer(Promo_12),
+         Promo_6 = as.integer(Promo_6),
+         Promo_7 = as.integer(Promo_7),
+         Promo_8 = as.integer(Promo_8),
+         Promo_9 = as.integer(Promo_9),
+         Promo_13 = as.integer(Promo_13),
+         Promo_10 = as.integer(Promo_10),          
+         Promo_11 = as.integer(Promo_11),
+         Promo_12 = as.integer(Promo_12)) %>%
+  select(-Promo_12)
+
+#########################################
+
+df_KPI_1 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_1_Purchasers") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_2_Purchasers)
+
+names(df_KPI_1) <- c("Date", "KPI_1")
+
+df_KPI_1_Forecast <- read_csv("forecasts/Cust_type_2_KPI_1Purchasers_forecast.csv")
+
+df_KPI_1_Forecast <- df_KPI_1_Forecast[,c(1,4)]
+
+names(df_KPI_1_Forecast) <- c("Date", "KPI_1")
+
+df_KPI_1 <- rbind(df_KPI_1, df_KPI_1_Forecast)
+
+rm(df_KPI_1_Forecast)
+
+###################################################################
+
+df_promos <- left_join(df_promos, df_KPI_1, by = "Date")
+df_sales <- left_join(df_sales, df_promos, by = "Date")
+
+head(df_sales)
+```
+
+```{r}
+df_sales %>%
+  ggplot(aes(Date, Sales)) +
+  geom_line() + 
+  geom_point()+
+  geom_smooth() +
+  labs(title = "Native Sales - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+```
+detrends sales
+```{r}
+# STL Decomposition
+detrended_sales <- df_sales
+stl_decomposition <- stl(ts(detrended_sales$Sales, frequency = 12), s.window = "periodic")
+trend_component <- stl_decomposition$time.series[, "trend"]
+detrended_sales$detrended_stl <- detrended_sales$Sales - trend_component
+
+# Visualize
+ggplot(detrended_sales, aes(Date, detrended_stl)) +
+  geom_line() + 
+  geom_point() +
+  geom_smooth() +
+  labs(title = "STL Detrended KPI_1 Purchasers - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+
+# Plot ACF (Autocorrelation) and PACF (Partial Autocorrelation) with more lags
+acf(detrended_sales$detrended_stl, lag.max = 20)
+pacf(detrended_sales$detrended_stl, lag.max = 20)
+
+rm(detrended_sales)
+```
+
+```{r}
+df_sales %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+Data Preparation
+```{r}
+lag_df_sales <- df_sales %>%
+  arrange(Date) %>%
+  mutate(Sales_lag1 = lag(Sales, 1),
+         Sales_lag3 = lag(Sales, 3),
+         Sales_lag6 = lag(Sales, 6),
+         Sales_lag9 = lag(Sales, 9),
+         Sales_lag12 = lag(Sales, 12)) %>% 
+  drop_na()
+
+Splits <- initial_time_split(lag_df_sales, prop = 0.85)
+
+Splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, Sales,.interactive = TRUE)
+```
+
+
+
+Model Pre-Processing
+```{r}
+recipe_spec <- recipe(Sales ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_2 <- recipe(Sales ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 2) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_3 <- recipe(Sales ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 3) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+###########################
+# Recipe 1
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet <- workflow() %>%
+  add_model(fit_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 2
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_2 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_2 <- workflow() %>%
+  add_model(fit_glmnet_2) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_2<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_2 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_2 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_2 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Prophet
+fit_prophet_2 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 3
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_3 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_3 <- workflow() %>%
+  add_model(fit_glmnet_3) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_3 <- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_3 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_3 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_3 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Prophet
+fit_prophet_3 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+
+### Add fitted model to a Model Table
+models_tbl <-
+  modeltime_table(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3
+  )
+###########################
+
+rm(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3,
+    recipe_spec,
+    recipe_spec_2,
+    recipe_spec_3
+)
+
+### Calibration
+calibration_table <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(Splits))
+```
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(
+    new_data = testing(Splits),
+    actual_data = lag_df_sales
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+
+```{r}
+dates <- KPI_1(df_sales$Date)
+`%ni%` <- Negate(`%in%`)
+
+df_promos <- df_promos %>% 
+  select(Date, Promo_1, Promo_2, Promo_3, Promo_4, Promo_6, Promo_7, Promo_8, Promo_9, Promo_13, Promo_10, Promo_5,Promo_11, KPI_1, Promo_12) #%>%
+  #filter(Date %ni% dates)
+
+df_promos <- recipe(KPI_1 ~ ., df_promos) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(df_promos)
+```
+
+
+```{r}
+# Finds the min RMSE model that is not overfitting
+min_rmse_model <- calibration_table %>%
+  modeltime_accuracy() %>%
+  filter(rsq < 0.97) %>%
+  filter(rmse == min(rmse)) %>%
+  select(.model_id) %>%
+  pull()
+
+#####
+# Luke test forecast
+#####
+
+df_combined <- left_join(df_promos, 
+                         df_sales %>% select(Date,Sales), 
+                         by = "Date") %>% 
+  arrange(Date)
+
+df_combined <- df_combined  %>%
+  mutate(Sales_lag1 = lag(Sales, 1),
+         Sales_lag3 = lag(Sales, 3),
+         Sales_lag6 = lag(Sales, 6),
+         Sales_lag9 = lag(Sales, 9),
+         Sales_lag12 = lag(Sales, 12)) %>%
+  filter(!(Date < "2020-01-01"))
+
+actual_sales_data <- df_combined %>%
+  filter(!(is.na(Sales)))
+
+new_data <- df_combined %>%
+  filter(is.na(Sales)) %>%
+  select(-Sales) %>%
+  filter(!(is.na(Sales_lag1)))
+
+# Defines how many months out you Cust_type_1nt to filter (6 = 6 months)
+forecast_horizon <- 10
+
+generate_forecast <- function(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon) {
+  
+  forecast_results <- actual_sales_data
+  
+  modeltime_actual_data_format <- actual_sales_data %>% 
+      mutate(
+        .index = Date,
+        .value = Sales,
+        .conf_lo = NA,
+        .conf_hi = NA,
+        .key = "actual",
+        .model_desc = "ACTUAL",
+        .model_id = NA
+    ) %>%
+    select(.index, .value, .conf_lo, .conf_hi, .key, .model_desc, .model_id)
+  
+  df_combined <- df_combined %>%
+    select(Date,Sales,KPI_1,Promo_1,Promo_2,Promo_3,Promo_4,Promo_6,Promo_7,Promo_8,Promo_9,Promo_13,Promo_10,Promo_11,Promo_5,
+           Promo_12,Sales_lag1,Sales_lag3,Sales_lag6,Sales_lag9,Sales_lag12)
+  
+  for (i in 1:forecast_horizon) {
+    forecast <- calibration_table %>%
+      filter(.model_id %in% min_rmse_model) %>%
+      modeltime_refit(df_combined %>%
+                        filter(!is.na(Sales)) %>% # Remove NAs in Sales
+                        filter(!is.na(Sales_lag1)) %>%  # Remove NAs in Sales_lag1
+                        filter(!is.na(Sales_lag3)) %>%
+                        filter(!is.na(Sales_lag6)) %>%
+                        filter(!is.na(Sales_lag9)) %>%
+                        filter(!is.na(Sales_lag12))
+                      ) %>%
+      modeltime_forecast(
+        new_data = new_data,
+        actual_data = forecast_results
+      )
+    
+    # Extract the forecasted value
+    forecasted_value <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .value) %>%
+      slice_tail(n = 1) %>%
+      pull(.value)
+    
+    # Extract the .conf_lo value
+    forecasted_lo <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_lo) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_lo)
+    
+    # Extract the .conf_hi value
+    forecasted_hi <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_hi) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_hi)
+    
+    # Add the forecasted value to the results
+    next_date <- max(forecast_results$Date) + months(1)
+    next_row <- data.frame(Date = next_date,
+                           Sales = forecasted_value,
+                           Sales_lag1 = NA,
+                           Sales_lag3 = NA,
+                           Sales_lag6 = NA,
+                           Sales_lag9 = NA,
+                           Sales_lag12 = NA)
+    
+    forecast_results <- bind_rows(forecast_results, next_row)
+    
+    #Creates a separate forecast table in the Modeltime format
+    Luke_forecast <- data.frame(
+      .index = next_date,
+      .value = forecasted_value,
+      .conf_lo = forecasted_lo,
+      .conf_hi = forecasted_hi,
+      .key = "prediction",
+      .model_desc = calibration_table %>%
+        filter(.model_id %in% min_rmse_model) %>%
+        pull(.model_desc),
+      .model_id = min_rmse_model
+    )
+    
+    modeltime_actual_data_format <- bind_rows(modeltime_actual_data_format,Luke_forecast)
+    
+    # Update lag_df_KPI_1 for next iteration
+    df_combined <- df_combined %>%
+      mutate(
+        Sales = if_else(Date == next_date, forecasted_value, Sales),
+        Sales_lag1 = lag(Sales, 1),
+        Sales_lag3 = lag(Sales, 3),
+        Sales_lag6 = lag(Sales, 6),
+        Sales_lag9 = lag(Sales, 9),
+        Sales_lag12 = lag(Sales, 12)
+      )
+    
+    # Updates forecast_results
+    forecast_results <- df_combined %>% 
+      filter(!(is.na(Sales)))
+    
+    # Update new_data for the next iteration
+    new_data <- df_combined %>%
+      filter(is.na(Sales)) %>%
+      select(-Sales) %>%
+      filter(!(is.na(Sales_lag1)))
+  }
+  
+  return(modeltime_actual_data_format)
+}
+
+# Generates forecast
+forecast_results <- generate_forecast(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon)
+
+forecast_results %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+
+Export <- forecast_results %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export, "forecasts/Cust_type_2_NativeSales_forecast.csv")
+```
+
+
+###
+# Actual
+###
+
+
+```{r}
+# Load in Raw Data
+df_sales <- read_xlsx("data/Forecast_Data.xlsx", sheet = "Native_Sales") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Native_Sales)
+
+names(df_sales) <- c("Date", "Sales")
+
+df_promos <- read_xlsx("data/Forecast_Data.xlsx", sheet = "JPN_Promos") %>%
+  mutate(Date = ymd(Date),
+         Promo_1 = as.integer(Promo_1),
+         Promo_2 = as.integer(Promo_2),
+         Promo_3 = as.integer(Promo_3),
+         Promo_4 = as.integer(Promo_4),
+         Promo_5 = as.integer(Promo_12),
+         Promo_6 = as.integer(Promo_6),
+         Promo_7 = as.integer(Promo_7),
+         Promo_8 = as.integer(Promo_8),
+         Promo_9 = as.integer(Promo_9),
+         Promo_13 = as.integer(Promo_13),
+         Promo_10 = as.integer(Promo_10),          
+         Promo_11 = as.integer(Promo_11),
+         Promo_12 = as.integer(Promo_12)) %>%
+  select(-Promo_12)
+
+#########################################
+
+df_KPI_1 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_1_Purchasers") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, KPI_1_Purchasers)
+
+names(df_KPI_1) <- c("Date", "KPI_1")
+
+df_KPI_1_Forecast <- read_csv("forecasts/KPI_1Purchasers_forecast.csv")
+
+df_KPI_1_Forecast <- df_KPI_1_Forecast[,c(1,4)]
+
+names(df_KPI_1_Forecast) <- c("Date", "KPI_1")
+
+df_KPI_1 <- rbind(df_KPI_1, df_KPI_1_Forecast)
+
+rm(df_KPI_1_Forecast)
+
+###################################################################
+
+# Adds Cust_type_1 & Cust_type_2 data NOT NEEDED
+
+df_Cust_type_1 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "Native_Sales") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_1_Sales)
+
+names(df_Cust_type_1) <- c("Date", "Cust_type_1")
+
+df_Cust_type_1_Forecast <- read_csv("forecasts/Cust_type_1_NativeSales_forecast.csv")
+
+# df_KPI_1_Forecast$.index <- mdy(df_KPI_1_Forecast$.index)
+
+df_Cust_type_1_Forecast <- df_Cust_type_1_Forecast[,c(1,4)]
+
+names(df_Cust_type_1_Forecast) <- c("Date", "Cust_type_1")
+
+df_Cust_type_1 <- rbind(df_Cust_type_1, df_Cust_type_1_Forecast)
+
+rm(df_Cust_type_1_Forecast)
+###################################################################
+
+df_Cust_type_2 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "Native_Sales") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_2_Sales)
+
+names(df_Cust_type_2) <- c("Date", "Cust_type_2")
+
+df_Cust_type_2_Forecast <- read_csv("forecasts/Cust_type_2_NativeSales_forecast.csv")
+
+# df_KPI_1_Forecast$.index <- mdy(df_KPI_1_Forecast$.index)
+
+df_Cust_type_2_Forecast <- df_Cust_type_2_Forecast[,c(1,4)]
+
+names(df_Cust_type_2_Forecast) <- c("Date", "Cust_type_2")
+
+df_Cust_type_2 <- rbind(df_Cust_type_2, df_Cust_type_2_Forecast)
+
+#rm(df_Cust_type_2_Forecast)
+###################################################################
+
+df_promos <- left_join(df_promos, df_KPI_1, by = "Date")
+df_promos <- left_join(df_promos, df_Cust_type_1, by = "Date")
+df_promos <- left_join(df_promos, df_Cust_type_2, by = "Date")
+df_sales <- left_join(df_sales, df_promos, by = "Date")
+
+
+head(df_sales)
+```
+
+```{r}
+df_sales %>%
+  ggplot(aes(Date, Sales)) +
+  geom_line() + 
+  geom_point()+
+  geom_smooth() +
+  labs(title = "Native Sales - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+```
+
+detrends sales
+```{r}
+# STL Decomposition
+detrended_sales <- df_sales
+stl_decomposition <- stl(ts(detrended_sales$Sales, frequency = 12), s.window = "periodic")
+trend_component <- stl_decomposition$time.series[, "trend"]
+detrended_sales$detrended_stl <- detrended_sales$Sales - trend_component
+
+# Visualize
+ggplot(detrended_sales, aes(Date, detrended_stl)) +
+  geom_line() + 
+  geom_point() +
+  geom_smooth() +
+  labs(title = "STL Detrended KPI_1 Purchasers - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+
+# Create a time series object for detrended_stl with the correct frequency and start period
+detrended_stl_ts <- ts(detrended_sales$detrended_stl, frequency = 12, start = c(year(min(detrended_sales$Date)), month(min(detrended_sales$Date))))
+
+# Plot ACF (Autocorrelation) and PACF (Partial Autocorrelation) with more lags
+acf(detrended_stl_ts, lag.max = nrow(detrended_sales), xlab="Lag (years)")
+pacf(detrended_stl_ts, lag.max = nrow(detrended_sales), xlab="Lag (years)")
+
+rm(detrended_sales,detrended_stl_ts,stl_decomposition,trend_component)
+```
+
+
+```{r}
+df_sales %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+Data Preparation
+```{r}
+lag_df_sales <- df_sales %>%
+  arrange(Date) %>%
+  mutate(Sales_lag1 = lag(Sales, 1),
+         Sales_lag3 = lag(Sales, 3),
+         Sales_lag6 = lag(Sales, 6),
+         Sales_lag9 = lag(Sales, 9),
+         Sales_lag12 = lag(Sales, 12)) %>% 
+  filter(!(Date < "2020-01-01"))
+
+Splits <- initial_time_split(lag_df_sales, prop = 0.85)
+
+Splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, Sales,.interactive = TRUE)
+```
+
+
+Model Pre-Processing
+```{r}
+recipe_spec <- recipe(Sales ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_2 <- recipe(Sales ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 2) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_3 <- recipe(Sales ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 3) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+###########################
+# Recipe 1
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet <- workflow() %>%
+  add_model(fit_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 2
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_2 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_2 <- workflow() %>%
+  add_model(fit_glmnet_2) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_2<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_2 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_2 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_2 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Prophet
+fit_prophet_2 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 3
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_3 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_3 <- workflow() %>%
+  add_model(fit_glmnet_3) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_3 <- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_3 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_3 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_3 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Prophet
+fit_prophet_3 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+
+### Add fitted model to a Model Table
+models_tbl <-
+  modeltime_table(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3
+  )
+###########################
+
+rm(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3,
+    recipe_spec,
+    recipe_spec_2,
+    recipe_spec_3
+)
+
+### Calibration
+calibration_table <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(Splits))
+```
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(
+    new_data = testing(Splits),
+    actual_data = lag_df_sales
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+
+```{r}
+dates <- KPI_1(df_sales$Date)
+`%ni%` <- Negate(`%in%`)
+
+df_promos <- df_promos %>% 
+  select(Date, Promo_1, Promo_2, Promo_3, Promo_4, Promo_6, Promo_7, Promo_8, Promo_9, Promo_13, Promo_10, Promo_5,Promo_11, KPI_1,
+         Promo_12, Cust_type_1, Cust_type_2) #%>%
+  #filter(Date %ni% dates)
+
+df_promos <- recipe(KPI_1 ~ ., df_promos) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(df_promos)
+```
+
+
+```{r}
+# Finds the min RMSE model that is not overfitting
+min_rmse_model <- calibration_table %>%
+  modeltime_accuracy() %>%
+  filter(rsq < 0.97) %>%
+  filter(rmse == min(rmse)) %>%
+  select(.model_id) %>%
+  pull()
+
+#####
+# Luke test forecast
+#####
+
+df_combined <- left_join(df_promos, 
+                         df_sales %>% select(Date,Sales), 
+                         by = "Date") %>% 
+  arrange(Date)
+
+df_combined <- df_combined  %>%
+  mutate(Sales_lag1 = lag(Sales, 1),
+         Sales_lag3 = lag(Sales, 3),
+         Sales_lag6 = lag(Sales, 6),
+         Sales_lag9 = lag(Sales, 9),
+         Sales_lag12 = lag(Sales, 12)) %>%
+  filter(!(Date < "2020-01-01"))
+
+actual_sales_data <- df_combined %>%
+  filter(!(is.na(Sales)))
+
+new_data <- df_combined %>%
+  filter(is.na(Sales)) %>%
+  select(-Sales) %>%
+  filter(!(is.na(Sales_lag1)))
+
+# Defines how many months out you Cust_type_1nt to filter (6 = 6 months)
+forecast_horizon <- 10
+
+generate_forecast <- function(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon) {
+  
+  forecast_results <- actual_sales_data
+  
+  modeltime_actual_data_format <- actual_sales_data %>% 
+      mutate(
+        .index = Date,
+        .value = Sales,
+        .conf_lo = NA,
+        .conf_hi = NA,
+        .key = "actual",
+        .model_desc = "ACTUAL",
+        .model_id = NA
+    ) %>%
+    select(.index, .value, .conf_lo, .conf_hi, .key, .model_desc, .model_id)
+  
+  df_combined <- df_combined %>%
+    select(Date,Sales,KPI_1,Promo_1,Promo_2,Promo_3,Promo_4,Promo_6,Promo_7,Promo_8,Promo_9,Promo_13,Promo_10,Promo_11,Promo_5,
+           Promo_12,Sales_lag1,Sales_lag3,Sales_lag6,Sales_lag9,Sales_lag12,Cust_type_1,Cust_type_2)
+  
+  for (i in 1:forecast_horizon) {
+    forecast <- calibration_table %>%
+      filter(.model_id %in% min_rmse_model) %>%
+      modeltime_refit(df_combined %>%
+                        filter(!is.na(Sales)) %>% # Remove NAs in Sales
+                        filter(!is.na(Sales_lag1)) %>% # Remove NAs in Sales_lag1
+                        filter(!is.na(Sales_lag3)) %>%
+                        filter(!is.na(Sales_lag6)) %>%
+                        filter(!is.na(Sales_lag9)) %>%
+                        filter(!is.na(Sales_lag12))
+                      ) %>%
+      modeltime_forecast(
+        new_data = new_data,
+        actual_data = forecast_results
+      )
+    
+    # Extract the forecasted value
+    forecasted_value <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .value) %>%
+      slice_tail(n = 1) %>%
+      pull(.value)
+    
+    # Extract the .conf_lo value
+    forecasted_lo <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_lo) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_lo)
+    
+    # Extract the .conf_hi value
+    forecasted_hi <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_hi) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_hi)
+    
+    # Add the forecasted value to the results
+    next_date <- max(forecast_results$Date) + months(1)
+    next_row <- data.frame(Date = next_date,
+                           Sales = forecasted_value,
+                           Sales_lag1 = NA,
+                           Sales_lag3 = NA,
+                           Sales_lag6 = NA,
+                           Sales_lag9 = NA,
+                           Sales_lag12 = NA)
+    
+    forecast_results <- bind_rows(forecast_results, next_row)
+    
+    #Creates a separate forecast table in the Modeltime format
+    Luke_forecast <- data.frame(
+      .index = next_date,
+      .value = forecasted_value,
+      .conf_lo = forecasted_lo,
+      .conf_hi = forecasted_hi,
+      .key = "prediction",
+      .model_desc = calibration_table %>%
+        filter(.model_id %in% min_rmse_model) %>%
+        pull(.model_desc),
+      .model_id = min_rmse_model
+    )
+    
+    modeltime_actual_data_format <- bind_rows(modeltime_actual_data_format,Luke_forecast)
+    
+    # Update lag_df_KPI_1 for next iteration
+    df_combined <- df_combined %>%
+      mutate(
+        Sales = if_else(Date == next_date, forecasted_value, Sales),
+        Sales_lag1 = lag(Sales, 1),
+        Sales_lag3 = lag(Sales, 3),
+        Sales_lag6 = lag(Sales, 6),
+        Sales_lag9 = lag(Sales, 9),
+        Sales_lag12 = lag(Sales, 12)
+      )
+    
+    # Updates forecast_results
+    forecast_results <- df_combined %>% 
+      filter(!(is.na(Sales)))
+    
+    # Update new_data for the next iteration
+    new_data <- df_combined %>%
+      filter(is.na(Sales)) %>%
+      select(-Sales) %>%
+      filter(!(is.na(Sales_lag1)))
+  }
+  
+  return(modeltime_actual_data_format)
+}
+
+# Generates forecast
+forecast_results <- generate_forecast(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon)
+
+forecast_results %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+
+Export <- forecast_results %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export, "forecasts/NativeSales_forecast.csv")
+```
+
+
+######################################################################################
+#
+# KPI_2
+#
+######################################################################################
+
+
+###
+# Cust_type_1
+###
+
+
+```{r}
+# Load in Raw Data
+df_KPI_2 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_2") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_1_KPI_2) #%>%
+  #filter(Date > as.Date("2020-01-01"))
+
+names(df_KPI_2) <- c("Date", "KPI_2")
+
+df_promos <- read_xlsx("data/Forecast_Data.xlsx", sheet = "JPN_Promos") %>%
+  mutate(Date = ymd(Date),
+         Promo_1 = as.integer(Promo_1),
+         Promo_2 = as.integer(Promo_2),
+         Promo_3 = as.integer(Promo_3),
+         Promo_4 = as.integer(Promo_4),
+         Promo_5 = as.integer(Promo_12),
+         Promo_6 = as.integer(Promo_6),
+         Promo_7 = as.integer(Promo_7),
+         Promo_8 = as.integer(Promo_8),
+         Promo_9 = as.integer(Promo_9),
+         Promo_13 = as.integer(Promo_13),
+         Promo_10 = as.integer(Promo_10),         
+         Promo_11 = as.integer(Promo_11),
+         Promo_12 = as.integer(Promo_12)) %>%
+  select(-Promo_12) %>%
+  select(-Promo_12)
+
+###################################################################
+# Reads in KPI_1
+###
+
+df_KPI_1 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_1_Purchasers") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_1_Purchasers)
+
+names(df_KPI_1) <- c("Date", "KPI_1")
+
+df_KPI_1_Forecast <- read_csv("forecasts/Cust_type_1_KPI_1Purchasers_forecast.csv")
+
+df_KPI_1_Forecast <- df_KPI_1_Forecast[,c(1,4)]
+
+names(df_KPI_1_Forecast) <- c("Date", "KPI_1")
+
+df_KPI_1 <- rbind(df_KPI_1, df_KPI_1_Forecast)
+
+rm(df_KPI_1_Forecast)
+###################################################################
+# Reads in Sales, OG code. Removing for this test iteration
+###
+
+#df_Sales <- read_xlsx("data/Forecast_Data.xlsx", sheet = "Native_Sales") %>%
+  #mutate(Date = ymd(Date)) %>%
+  #select(Date, Cust_type_1_Sales)
+
+#names(df_Sales) <- c("Date", "Sales")
+
+#df_Sales_Forecast <- read_csv("forecasts/Cust_type_1_NativeSales_forecast.csv")
+
+# df_Sales_Forecast$.index <- mdy(df_Sales_Forecast$.index)
+
+#df_Sales_Forecast <- df_Sales_Forecast[,c(1,4)]
+#names(df_Sales_Forecast) <- c("Date", "Sales")
+
+#df_Sales <- rbind(df_Sales, df_Sales_Forecast)
+
+#rm(df_Sales_Forecast)
+###################################################################
+
+df_promos <- left_join(df_promos, df_KPI_1, by = "Date")
+#df_promos <- left_join(df_promos, df_Sales, by = "Date")
+df_KPI_2 <- left_join(df_KPI_2, df_promos, by = "Date")
+
+head(df_KPI_2)
+```
+
+```{r}
+df_KPI_2 %>%
+  ggplot(aes(Date, KPI_2)) +
+  geom_line() + 
+  geom_point()+
+  geom_smooth() +
+  labs(title = "KPI_2 - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+```
+
+```{r}
+# STL Decomposition
+detrended_Promo_6 <- df_KPI_2
+stl_decomposition <- stl(ts(detrended_Promo_6$KPI_2, frequency = 12), s.window = "periodic")
+trend_component <- stl_decomposition$time.series[, "trend"]
+detrended_Promo_6$detrended_stl <- detrended_Promo_6$KPI_2 - trend_component
+
+# Visualize
+ggplot(detrended_Promo_6, aes(Date, detrended_stl)) +
+  geom_line() + 
+  geom_point() +
+  geom_smooth() +
+  labs(title = "STL Detrended KPI_2 - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+
+# Plot ACF (Autocorrelation) and PACF (Partial Autocorrelation) with more lags
+acf(detrended_Promo_6$detrended_stl, lag.max = nrow(detrended_Promo_6), xlab="Lag (years)")
+pacf(detrended_Promo_6$detrended_stl, lag.max = nrow(detrended_Promo_6), xlab="Lag (years)")
+
+rm(detrended_Promo_6,trend_component,stl_decomposition)
+```
+
+
+```{r}
+df_KPI_2 %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+Data Preparation
+```{r}
+lag_df_KPI_2 <- df_KPI_2 %>%
+  arrange(Date) %>%
+  mutate(KPI_2_lag1 = lag(KPI_2, 1),
+         KPI_2_lag3 = lag(KPI_2, 3),
+         KPI_2_lag6 = lag(KPI_2, 6),
+         KPI_2_lag9 = lag(KPI_2, 9),
+         KPI_2_lag12 = lag(KPI_2, 12)) %>% 
+  drop_na()
+
+Splits <- initial_time_split(lag_df_KPI_2, prop = 0.85)
+
+Splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, KPI_2,.interactive = TRUE)
+```
+
+
+Model Pre-Processing
+```{r}
+recipe_spec <- recipe(KPI_2 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_2 <- recipe(KPI_2 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 2) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_3 <- recipe(KPI_2 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 3) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+###########################
+# Recipe 1
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet <- workflow() %>%
+  add_model(fit_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 2
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_2 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_2 <- workflow() %>%
+  add_model(fit_glmnet_2) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_2<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_2 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_2 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_2 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Prophet
+fit_prophet_2 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 3
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_3 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_3 <- workflow() %>%
+  add_model(fit_glmnet_3) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_3 <- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_3 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_3 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_3 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Prophet
+fit_prophet_3 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+
+### Add fitted model to a Model Table
+models_tbl <-
+  modeltime_table(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3
+  )
+###########################
+
+rm(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_ets_2,
+    fit_ets_3,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3,
+    recipe_spec,
+    recipe_spec_2,
+    recipe_spec_3
+)
+
+### Calibration
+calibration_table <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(Splits))
+```
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(
+    new_data = testing(Splits),
+    actual_data = lag_df_KPI_2
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+
+```{r}
+dates <- KPI_1(df_KPI_2$Date)
+`%ni%` <- Negate(`%in%`)
+
+df_promos <- df_promos %>% 
+  select(Date, Promo_1, Promo_2, Promo_3, Promo_4, Promo_6, Promo_7, Promo_8, Promo_9, Promo_13, Promo_10, Promo_5,Promo_11,KPI_1) #%>%
+  #filter(Date %ni% dates)
+
+df_promos <- recipe(Promo_5 ~ ., df_promos) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(df_promos)
+```
+
+
+```{r}
+# Finds the min RMSE model that is not overfitting
+min_rmse_model <- calibration_table %>%
+  modeltime_accuracy() %>%
+  filter(rsq < 0.97) %>%
+  filter(rmse == min(rmse)) %>%
+  select(.model_id) %>%
+  pull()
+
+#####
+# Luke test forecast
+#####
+
+df_combined <- left_join(df_promos, 
+                         df_KPI_2 %>% select(Date,KPI_2), 
+                         by = "Date") %>% 
+  arrange(Date)
+
+df_combined <- df_combined  %>%
+  mutate(KPI_2_lag1 = lag(KPI_2, 1),
+         KPI_2_lag3 = lag(KPI_2, 3),
+         KPI_2_lag6 = lag(KPI_2, 6),
+         KPI_2_lag9 = lag(KPI_2, 9),
+         KPI_2_lag12 = lag(KPI_2, 12)) %>%
+  filter(!(Date < "2020-01-01"))
+
+actual_sales_data <- df_combined %>%
+  filter(!(is.na(KPI_2)))
+
+new_data <- df_combined %>%
+  filter(is.na(KPI_2)) %>%
+  select(-KPI_2) %>%
+  filter(!(is.na(KPI_2_lag1)))
+
+# Defines how many months out you Cust_type_1nt to filter (6 = 6 months)
+forecast_horizon <- 10
+
+generate_forecast <- function(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon) {
+  
+  forecast_results <- actual_sales_data
+  
+  modeltime_actual_data_format <- actual_sales_data %>% 
+      mutate(
+        .index = Date,
+        .value = KPI_2,
+        .conf_lo = NA,
+        .conf_hi = NA,
+        .key = "actual",
+        .model_desc = "ACTUAL",
+        .model_id = NA
+    ) %>%
+    select(.index, .value, .conf_lo, .conf_hi, .key, .model_desc, .model_id)
+  
+  df_combined <- df_combined %>%
+    select(Date,KPI_2,Promo_1,Promo_2,Promo_3,Promo_4,Promo_6,Promo_7,Promo_8,Promo_9,Promo_13,Promo_10,Promo_11,Promo_5,
+           KPI_2_lag1,KPI_2_lag3,KPI_2_lag6,KPI_2_lag9,KPI_2_lag12,KPI_1)
+  
+  for (i in 1:forecast_horizon) {
+    forecast <- calibration_table %>%
+      filter(.model_id %in% min_rmse_model) %>%
+      modeltime_refit(df_combined %>%
+                        filter(!is.na(KPI_2)) %>% # Remove NAs in KPI_2
+                        filter(!is.na(KPI_2_lag1)) %>% # Remove NAs in KPI_2_lag1
+                        filter(!is.na(KPI_2_lag3)) %>%
+                        filter(!is.na(KPI_2_lag6)) %>%
+                        filter(!is.na(KPI_2_lag9)) %>%
+                        filter(!is.na(KPI_2_lag12))
+                      ) %>%
+      modeltime_forecast(
+        new_data = new_data,
+        actual_data = forecast_results
+      )
+    
+    # Extract the forecasted value
+    forecasted_value <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .value) %>%
+      slice_tail(n = 1) %>%
+      pull(.value)
+    
+    # Extract the .conf_lo value
+    forecasted_lo <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_lo) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_lo)
+    
+    # Extract the .conf_hi value
+    forecasted_hi <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_hi) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_hi)
+    
+    # Add the forecasted value to the results
+    next_date <- max(forecast_results$Date) + months(1)
+    next_row <- data.frame(Date = next_date,
+                           KPI_2 = forecasted_value,
+                           KPI_2_lag1 = NA,
+                           KPI_2_lag3 = NA,
+                           KPI_2_lag6 = NA,
+                           KPI_2_lag9 = NA,
+                           KPI_2_lag12 = NA)
+    
+    forecast_results <- bind_rows(forecast_results, next_row)
+    
+    #Creates a separate forecast table in the Modeltime format
+    Luke_forecast <- data.frame(
+      .index = next_date,
+      .value = forecasted_value,
+      .conf_lo = forecasted_lo,
+      .conf_hi = forecasted_hi,
+      .key = "prediction",
+      .model_desc = calibration_table %>%
+        filter(.model_id %in% min_rmse_model) %>%
+        pull(.model_desc),
+      .model_id = min_rmse_model
+    )
+    
+    modeltime_actual_data_format <- bind_rows(modeltime_actual_data_format,Luke_forecast)
+    
+    # Update lag_df_KPI_1 for next iteration
+    df_combined <- df_combined %>%
+      mutate(
+        KPI_2 = if_else(Date == next_date, forecasted_value, KPI_2),
+        KPI_2_lag1 = lag(KPI_2, 1),
+        KPI_2_lag3 = lag(KPI_2, 3),
+        KPI_2_lag6 = lag(KPI_2, 6),
+        KPI_2_lag9 = lag(KPI_2, 9),
+        KPI_2_lag12 = lag(KPI_2, 12)
+      )
+    
+    # Updates forecast_results
+    forecast_results <- df_combined %>% 
+      filter(!(is.na(KPI_2)))
+    
+    # Update new_data for the next iteration
+    new_data <- df_combined %>%
+      filter(is.na(KPI_2)) %>%
+      select(-KPI_2) %>%
+      filter(!(is.na(KPI_2_lag1)))
+  }
+  
+  return(modeltime_actual_data_format)
+}
+
+# Generates forecast
+forecast_results <- generate_forecast(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon)
+
+forecast_results %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+
+Export <- forecast_results %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export, "forecasts/Cust_type_1_KPI_2_forecast.csv")
+```
+
+
+###
+# Cust_type_2
+###
+
+
+```{r}
+# Load in Raw Data
+df_KPI_2 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_2") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_2_KPI_2) #%>%
+  #filter(Date > as.Date("2020-01-01"))
+
+names(df_KPI_2) <- c("Date", "KPI_2")
+
+df_promos <- read_xlsx("data/Forecast_Data.xlsx", sheet = "JPN_Promos") %>%
+  mutate(Date = ymd(Date),
+         Promo_1 = as.integer(Promo_1),
+         Promo_2 = as.integer(Promo_2),
+         Promo_3 = as.integer(Promo_3),
+         Promo_4 = as.integer(Promo_4),
+         Promo_5 = as.integer(Promo_12),
+         Promo_6 = as.integer(Promo_6),
+         Promo_7 = as.integer(Promo_7),
+         Promo_8 = as.integer(Promo_8),
+         Promo_9 = as.integer(Promo_9),
+         Promo_13 = as.integer(Promo_13),
+         Promo_10 = as.integer(Promo_10),          
+         Promo_11 = as.integer(Promo_11),
+         Promo_12 = as.integer(Promo_12)) %>%
+  select(-Promo_12) %>%
+  select(-Promo_12)
+
+###################################################################
+# Reads in KPI_1, OG code. Removing for this test iteration
+###
+
+df_KPI_1 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_1_Purchasers") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_2_Purchasers)
+
+names(df_KPI_1) <- c("Date", "KPI_1")
+
+df_KPI_1_Forecast <- read_csv("forecasts/Cust_type_2_KPI_1Purchasers_forecast.csv")
+
+df_KPI_1_Forecast <- df_KPI_1_Forecast[,c(1,4)]
+
+names(df_KPI_1_Forecast) <- c("Date", "KPI_1")
+
+df_KPI_1 <- rbind(df_KPI_1, df_KPI_1_Forecast)
+
+rm(df_KPI_1_Forecast)
+###################################################################
+# Reads in Sales, OG code. Removing for this test iteration
+###
+
+#df_Sales <- read_xlsx("data/Forecast_Data.xlsx", sheet = "Native_Sales") %>%
+  #mutate(Date = ymd(Date)) %>%
+  #select(Date, Cust_type_2_Sales)
+
+#names(df_Sales) <- c("Date", "Sales")
+
+#df_Sales_Forecast <- read_csv("forecasts/Cust_type_2_NativeSales_forecast.csv")
+
+# df_Sales_Forecast$.index <- mdy(df_Sales_Forecast$.index)
+
+#df_Sales_Forecast <- df_Sales_Forecast[,c(1,4)]
+#names(df_Sales_Forecast) <- c("Date", "Sales")
+
+#df_Sales <- rbind(df_Sales, df_Sales_Forecast)
+
+#rm(df_Sales_Forecast)
+###################################################################
+
+df_promos <- left_join(df_promos, df_KPI_1, by = "Date")
+#df_promos <- left_join(df_promos, df_Sales, by = "Date")
+df_KPI_2 <- left_join(df_KPI_2, df_promos, by = "Date")
+
+head(df_KPI_2)
+```
+
+```{r}
+df_KPI_2 %>%
+  ggplot(aes(Date, KPI_2)) +
+  geom_line() + 
+  geom_point()+
+  geom_smooth() +
+  labs(title = "KPI_2 - Japan",
+       x = "",
+       y = "")
+```
+
+```{r}
+# STL Decomposition
+detrended_Promo_6 <- df_KPI_2
+stl_decomposition <- stl(ts(detrended_Promo_6$KPI_2, frequency = 12), s.window = "periodic")
+trend_component <- stl_decomposition$time.series[, "trend"]
+detrended_Promo_6$detrended_stl <- detrended_Promo_6$KPI_2 - trend_component
+
+# Visualize
+ggplot(detrended_Promo_6, aes(Date, detrended_stl)) +
+  geom_line() + 
+  geom_point() +
+  geom_smooth() +
+  labs(title = "STL Detrended KPI_1 Purchasers - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+
+# Plot ACF (Autocorrelation) and PACF (Partial Autocorrelation) with more lags
+acf(detrended_Promo_6$detrended_stl, lag.max = nrow(detrended_Promo_6), xlab="Lag (years)")
+pacf(detrended_Promo_6$detrended_stl, lag.max = nrow(detrended_Promo_6), xlab="Lag (years)")
+
+rm(detrended_Promo_6,trend_component,stl_decomposition)
+```
+
+```{r}
+df_KPI_2 %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+Data Preparation
+```{r}
+lag_df_KPI_2 <- df_KPI_2 %>%
+  arrange(Date) %>%
+  mutate(KPI_2_lag1 = lag(KPI_2, 1),
+         KPI_2_lag3 = lag(KPI_2, 3),
+         KPI_2_lag6 = lag(KPI_2, 6),
+         KPI_2_lag9 = lag(KPI_2, 9),
+         KPI_2_lag12 = lag(KPI_2, 12)) %>% 
+  drop_na()
+
+Splits <- initial_time_split(lag_df_KPI_2, prop = 0.85)
+
+Splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, KPI_2,.interactive = TRUE)
+```
+
+Model Pre-Processing
+```{r}
+recipe_spec <- recipe(KPI_2 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_2 <- recipe(KPI_2 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 2) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_3 <- recipe(KPI_2 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 3) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+###########################
+# Recipe 1
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet <- workflow() %>%
+  add_model(fit_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 2
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_2 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_2 <- workflow() %>%
+  add_model(fit_glmnet_2) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_2<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_2 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_2 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_2 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Prophet
+fit_prophet_2 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 3
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_3 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_3 <- workflow() %>%
+  add_model(fit_glmnet_3) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_3 <- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_3 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_3 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_3 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Prophet
+fit_prophet_3 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+
+### Add fitted model to a Model Table
+models_tbl <-
+  modeltime_table(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3
+  )
+###########################
+
+rm(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3,
+    recipe_spec,
+    recipe_spec_2,
+    recipe_spec_3
+)
+
+### Calibration
+calibration_table <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(Splits))
+```
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(
+    new_data = testing(Splits),
+    actual_data = lag_df_KPI_2
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+
+```{r}
+dates <- KPI_1(df_KPI_2$Date)
+`%ni%` <- Negate(`%in%`)
+
+df_promos <- df_promos %>% 
+  select(Date, Promo_1, Promo_2, Promo_3, Promo_4, Promo_6, Promo_7, Promo_8, Promo_9, Promo_13, Promo_10, Promo_5,Promo_11, KPI_1) #%>%
+  #filter(Date %ni% dates)
+
+df_promos <- recipe(Promo_5 ~ ., df_promos) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(df_promos)
+```
+
+
+```{r}
+# Finds the min RMSE model that is not overfitting
+min_rmse_model <- calibration_table %>%
+  modeltime_accuracy() %>%
+  filter(rsq < 0.97) %>%
+  filter(rmse == min(rmse)) %>%
+  select(.model_id) %>%
+  pull()
+
+#####
+# Luke test forecast
+#####
+
+df_combined <- left_join(df_promos, 
+                         df_KPI_2 %>% select(Date,KPI_2), 
+                         by = "Date") %>% 
+  arrange(Date)
+
+df_combined <- df_combined  %>%
+  mutate(KPI_2_lag1 = lag(KPI_2, 1),
+         KPI_2_lag3 = lag(KPI_2, 3),
+         KPI_2_lag6 = lag(KPI_2, 6),
+         KPI_2_lag9 = lag(KPI_2, 9),
+         KPI_2_lag12 = lag(KPI_2, 12)) %>%
+  filter(!(Date < "2020-01-01"))
+
+actual_sales_data <- df_combined %>%
+  filter(!(is.na(KPI_2)))
+
+new_data <- df_combined %>%
+  filter(is.na(KPI_2)) %>%
+  select(-KPI_2) %>%
+  filter(!(is.na(KPI_2_lag1)))
+
+# Defines how many months out you Cust_type_1nt to filter (6 = 6 months)
+forecast_horizon <- 10
+
+generate_forecast <- function(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon) {
+  
+  forecast_results <- actual_sales_data
+  
+  modeltime_actual_data_format <- actual_sales_data %>% 
+      mutate(
+        .index = Date,
+        .value = KPI_2,
+        .conf_lo = NA,
+        .conf_hi = NA,
+        .key = "actual",
+        .model_desc = "ACTUAL",
+        .model_id = NA
+    ) %>%
+    select(.index, .value, .conf_lo, .conf_hi, .key, .model_desc, .model_id)
+  
+  df_combined <- df_combined %>%
+    select(Date,KPI_2,Promo_1,Promo_2,Promo_3,Promo_4,Promo_6,Promo_7,Promo_8,Promo_9,Promo_13,Promo_10,Promo_11,Promo_5,
+           KPI_2_lag1,KPI_2_lag3,KPI_2_lag6,KPI_2_lag9,KPI_2_lag12,KPI_1)
+  
+  for (i in 1:forecast_horizon) {
+    forecast <- calibration_table %>%
+      filter(.model_id %in% min_rmse_model) %>%
+      modeltime_refit(df_combined %>%
+                        filter(!is.na(KPI_2)) %>% # Remove NAs in KPI_2
+                        filter(!is.na(KPI_2_lag1)) # Remove NAs in KPI_2_lag1
+                      ) %>%
+      modeltime_forecast(
+        new_data = new_data,
+        actual_data = forecast_results
+      )
+    
+    # Extract the forecasted value
+    forecasted_value <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .value) %>%
+      slice_tail(n = 1) %>%
+      pull(.value)
+    
+    # Extract the .conf_lo value
+    forecasted_lo <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_lo) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_lo)
+    
+    # Extract the .conf_hi value
+    forecasted_hi <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_hi) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_hi)
+    
+    # Add the forecasted value to the results
+    next_date <- max(forecast_results$Date) + months(1)
+    next_row <- data.frame(Date = next_date,
+                           KPI_2 = forecasted_value,
+                           KPI_2_lag1 = NA)
+    
+    forecast_results <- bind_rows(forecast_results, next_row)
+    
+    #Creates a separate forecast table in the Modeltime format
+    Luke_forecast <- data.frame(
+      .index = next_date,
+      .value = forecasted_value,
+      .conf_lo = forecasted_lo,
+      .conf_hi = forecasted_hi,
+      .key = "prediction",
+      .model_desc = calibration_table %>%
+        filter(.model_id %in% min_rmse_model) %>%
+        pull(.model_desc),
+      .model_id = min_rmse_model
+    )
+    
+    modeltime_actual_data_format <- bind_rows(modeltime_actual_data_format,Luke_forecast)
+    
+    # Update lag_df_KPI_1 for next iteration
+    df_combined <- df_combined %>%
+      mutate(
+        KPI_2 = if_else(Date == next_date, forecasted_value, KPI_2),
+        KPI_2_lag1 = lag(KPI_2, 1)
+      )
+    
+    # Updates forecast_results
+    forecast_results <- df_combined %>% 
+      filter(!(is.na(KPI_2)))
+    
+    # Update new_data for the next iteration
+    new_data <- df_combined %>%
+      filter(is.na(KPI_2)) %>%
+      select(-KPI_2) %>%
+      filter(!(is.na(KPI_2_lag1)))
+  }
+  
+  return(modeltime_actual_data_format)
+}
+
+# Generates forecast
+forecast_results <- generate_forecast(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon)
+
+forecast_results %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+
+Export <- forecast_results %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export, "forecasts/Cust_type_2_KPI_2_forecast.csv")
+```
+
+
+###
+# Acutal
+###
+
+
+```{r}
+# Load in Raw Data
+df_KPI_2 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_2") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, KPI_2)
+
+names(df_KPI_2) <- c("Date", "KPI_2")
+
+df_promos <- read_xlsx("data/Forecast_Data.xlsx", sheet = "JPN_Promos") %>%
+  mutate(Date = ymd(Date),
+         Promo_1 = as.integer(Promo_1),
+         Promo_2 = as.integer(Promo_2),
+         Promo_3 = as.integer(Promo_3),
+         Promo_4 = as.integer(Promo_4),
+         Promo_5 = as.integer(Promo_12),
+         Promo_6 = as.integer(Promo_6),
+         Promo_7 = as.integer(Promo_7),
+         Promo_8 = as.integer(Promo_8),
+         Promo_9 = as.integer(Promo_9),
+         Promo_13 = as.integer(Promo_13),
+         Promo_10 = as.integer(Promo_10),          
+         Promo_11 = as.integer(Promo_11),
+         Promo_12 = as.integer(Promo_12)) %>%
+  select(-Promo_12) %>%
+  select(-Promo_12)
+
+###################################################################
+# Loads Cust_type_1 KPI_2 Forecast
+###
+
+df_Cust_type_1 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_2") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_1_KPI_2) 
+
+names(df_Cust_type_1) <- c("Date", "Cust_type_1")
+
+df_Cust_type_1_Forecast <- read_csv("forecasts/Cust_type_1_KPI_2_forecast.csv")
+
+# df_KPI_1_Forecast$.index <- mdy(df_KPI_1_Forecast$.index)
+
+df_Cust_type_1_Forecast <- df_Cust_type_1_Forecast[,c(1,4)]
+
+names(df_Cust_type_1_Forecast) <- c("Date", "Cust_type_1")
+
+df_Cust_type_1 <- rbind(df_Cust_type_1, df_Cust_type_1_Forecast)
+
+rm(df_Cust_type_1_Forecast)
+###################################################################
+# Cust_type_2 KPI_2 forecast
+###
+
+df_Cust_type_2 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_2") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_2_KPI_2)
+
+names(df_Cust_type_2) <- c("Date", "Cust_type_2")
+
+df_Cust_type_2_Forecast <- read_csv("forecasts/Cust_type_2_KPI_2_forecast.csv")
+
+# df_KPI_1_Forecast$.index <- mdy(df_KPI_1_Forecast$.index)
+
+df_Cust_type_2_Forecast <- df_Cust_type_2_Forecast[,c(1,4)]
+
+names(df_Cust_type_2_Forecast) <- c("Date", "Cust_type_2")
+
+df_Cust_type_2 <- rbind(df_Cust_type_2, df_Cust_type_2_Forecast)
+
+rm(df_Cust_type_2_Forecast)
+
+
+###################################################################
+# Reads in KPI_1, OG code. Removing for this test iteration
+###
+
+df_KPI_1 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_1_Purchasers") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_2_Purchasers)
+
+names(df_KPI_1) <- c("Date", "KPI_1")
+
+df_KPI_1_Forecast <- read_csv("forecasts/KPI_1Purchasers_forecast.csv")
+
+df_KPI_1_Forecast <- df_KPI_1_Forecast[,c(1,4)]
+
+names(df_KPI_1_Forecast) <- c("Date", "KPI_1")
+
+df_KPI_1 <- rbind(df_KPI_1, df_KPI_1_Forecast)
+
+rm(df_KPI_1_Forecast)
+###################################################################
+
+df_promos <- left_join(df_promos, df_Cust_type_2, by = "Date")
+df_promos <- left_join(df_promos, df_Cust_type_1, by = "Date")
+df_promos <- left_join(df_promos, df_KPI_1, by = "Date")
+df_KPI_2 <- left_join(df_KPI_2, df_promos, by = "Date")
+
+head(df_KPI_2)
+```
+
+```{r}
+df_KPI_2 %>%
+  ggplot(aes(Date, KPI_2)) +
+  geom_line() + 
+  geom_point()+
+  geom_smooth() +
+  labs(title = "KPI_2 - Japan",
+       x = "",
+       y = "")
+```
+
+```{r}
+# STL Decomposition
+detrended_Promo_6 <- df_KPI_2
+stl_decomposition <- stl(ts(detrended_Promo_6$KPI_2, frequency = 12), s.window = "periodic")
+trend_component <- stl_decomposition$time.series[, "trend"]
+detrended_Promo_6$detrended_stl <- detrended_Promo_6$KPI_2 - trend_component
+
+# Visualize
+ggplot(detrended_Promo_6, aes(Date, detrended_stl)) +
+  geom_line() + 
+  geom_point() +
+  geom_smooth() +
+  labs(title = "STL Detrended KPI_1 Purchasers - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+
+# Plot ACF (Autocorrelation) and PACF (Partial Autocorrelation) with more lags
+acf(detrended_Promo_6$detrended_stl, lag.max = nrow(detrended_Promo_6), xlab="Lag (years)")
+pacf(detrended_Promo_6$detrended_stl, lag.max = nrow(detrended_Promo_6), xlab="Lag (years)")
+
+rm(detrended_Promo_6,trend_component,stl_decomposition)
+```
+
+
+```{r}
+df_KPI_2 %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+Data Preparation
+```{r}
+lag_df_KPI_2 <- df_KPI_2 %>%
+  arrange(Date) %>%
+  mutate(KPI_2_lag1 = lag(KPI_2, 1),
+         KPI_2_lag3 = lag(KPI_2, 3),
+         KPI_2_lag6 = lag(KPI_2, 6),
+         KPI_2_lag9 = lag(KPI_2, 9),
+         KPI_2_lag12 = lag(KPI_2, 12)) %>% 
+  drop_na()
+
+Splits <- initial_time_split(lag_df_KPI_2, prop = 0.85)
+
+Splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, KPI_2,.interactive = TRUE)
+```
+
+
+Model Pre-Processing
+```{r}
+recipe_spec <- recipe(KPI_2 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_2 <- recipe(KPI_2 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 2) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_3 <- recipe(KPI_2 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 3) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+###########################
+# Recipe 1
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet <- workflow() %>%
+  add_model(fit_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 2
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_2 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_2 <- workflow() %>%
+  add_model(fit_glmnet_2) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_2<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_2 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_2 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_2 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Prophet
+fit_prophet_2 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 3
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_3 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_3 <- workflow() %>%
+  add_model(fit_glmnet_3) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_3 <- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_3 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_3 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_3 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Prophet
+fit_prophet_3 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+
+### Add fitted model to a Model Table
+models_tbl <-
+  modeltime_table(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3
+  )
+###########################
+
+rm(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3,
+    recipe_spec,
+    recipe_spec_2,
+    recipe_spec_3
+)
+
+### Calibration
+calibration_table <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(Splits))
+```
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(
+    new_data = testing(Splits),
+    actual_data = lag_df_KPI_2
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+
+```{r}
+dates <- KPI_1(df_KPI_2$Date)
+`%ni%` <- Negate(`%in%`)
+
+df_promos <- df_promos %>% 
+  select(Date, Promo_1, Promo_2, Promo_3, Promo_4, Promo_6, Promo_7, Promo_8, Promo_9, Promo_13, Promo_10, Promo_5,Promo_11, 
+         Cust_type_1, Cust_type_2, KPI_1)#,Promo_12) #%>%
+  #filter(Date %ni% dates)
+
+df_promos <- recipe(Promo_5 ~ ., df_promos) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(df_promos)
+```
+
+
+```{r}
+# Finds the min RMSE model that is not overfitting
+min_rmse_model <- calibration_table %>%
+  modeltime_accuracy() %>%
+  filter(rsq < 0.97) %>%
+  filter(rmse == min(rmse)) %>%
+  select(.model_id) %>%
+  pull()
+
+#####
+# Luke test forecast
+#####
+
+df_combined <- left_join(df_promos, 
+                         df_KPI_2 %>% select(Date,KPI_2), 
+                         by = "Date") %>% 
+  arrange(Date)
+
+df_combined <- df_combined  %>%
+  mutate(KPI_2_lag1 = lag(KPI_2, 1),
+         KPI_2_lag3 = lag(KPI_2, 3),
+         KPI_2_lag6 = lag(KPI_2, 6),
+         KPI_2_lag9 = lag(KPI_2, 9),
+         KPI_2_lag12 = lag(KPI_2, 12)) %>%
+  filter(!(Date < "2020-01-01"))
+
+actual_sales_data <- df_combined %>%
+  filter(!(is.na(KPI_2)))
+
+new_data <- df_combined %>%
+  filter(is.na(KPI_2)) %>%
+  select(-KPI_2) %>%
+  filter(!(is.na(KPI_2_lag1)))
+
+# Defines how many months out you Cust_type_1nt to filter (6 = 6 months)
+forecast_horizon <- 10
+
+generate_forecast <- function(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon) {
+  
+  forecast_results <- actual_sales_data
+  
+  modeltime_actual_data_format <- actual_sales_data %>% 
+      mutate(
+        .index = Date,
+        .value = KPI_2,
+        .conf_lo = NA,
+        .conf_hi = NA,
+        .key = "actual",
+        .model_desc = "ACTUAL",
+        .model_id = NA
+    ) %>%
+    select(.index, .value, .conf_lo, .conf_hi, .key, .model_desc, .model_id)
+  
+  df_combined <- df_combined %>%
+    select(Date,KPI_2,Promo_1,Promo_2,Promo_3,Promo_4,Promo_6,Promo_7,Promo_8,Promo_9,Promo_13,Promo_10,Promo_11,Promo_5,
+           KPI_2_lag1,KPI_2_lag3,KPI_2_lag6,KPI_2_lag9,KPI_2_lag12, Cust_type_1,
+           Cust_type_2, KPI_1)#,Promo_12)
+  
+  for (i in 1:forecast_horizon) {
+    forecast <- calibration_table %>%
+      filter(.model_id %in% min_rmse_model) %>%
+      modeltime_refit(df_combined %>%
+                        filter(!is.na(KPI_2)) %>% # Remove NAs in KPI_2
+                        filter(!is.na(KPI_2_lag1)) %>% # Remove NAs in KPI_2_lag1
+                        filter(!is.na(KPI_2_lag3)) %>%
+                        filter(!is.na(KPI_2_lag6)) %>%
+                        filter(!is.na(KPI_2_lag9)) %>%
+                        filter(!is.na(KPI_2_lag12))
+                      ) %>%
+      modeltime_forecast(
+        new_data = new_data,
+        actual_data = forecast_results
+      )
+    
+    # Extract the forecasted value
+    forecasted_value <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .value) %>%
+      slice_tail(n = 1) %>%
+      pull(.value)
+    
+    # Extract the .conf_lo value
+    forecasted_lo <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_lo) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_lo)
+    
+    # Extract the .conf_hi value
+    forecasted_hi <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_hi) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_hi)
+    
+    # Add the forecasted value to the results
+    next_date <- max(forecast_results$Date) + months(1)
+    next_row <- data.frame(Date = next_date,
+                           KPI_2 = forecasted_value,
+                           KPI_2_lag1 = NA,
+                           KPI_2_lag3 = NA,
+                           KPI_2_lag6 = NA,
+                           KPI_2_lag9 = NA,
+                           KPI_2_lag12 = NA)
+    
+    forecast_results <- bind_rows(forecast_results, next_row)
+    
+    #Creates a separate forecast table in the Modeltime format
+    Luke_forecast <- data.frame(
+      .index = next_date,
+      .value = forecasted_value,
+      .conf_lo = forecasted_lo,
+      .conf_hi = forecasted_hi,
+      .key = "prediction",
+      .model_desc = calibration_table %>%
+        filter(.model_id %in% min_rmse_model) %>%
+        pull(.model_desc),
+      .model_id = min_rmse_model
+    )
+    
+    modeltime_actual_data_format <- bind_rows(modeltime_actual_data_format,Luke_forecast)
+    
+    # Update lag_df_KPI_1 for next iteration
+    df_combined <- df_combined %>%
+      mutate(
+        KPI_2 = if_else(Date == next_date, forecasted_value, KPI_2),
+        KPI_2_lag1 = lag(KPI_2, 1),
+        KPI_2_lag3 = lag(KPI_2, 3),
+        KPI_2_lag6 = lag(KPI_2, 6),
+        KPI_2_lag9 = lag(KPI_2, 9),
+        KPI_2_lag12 = lag(KPI_2, 12)
+      )
+    
+    # Updates forecast_results
+    forecast_results <- df_combined %>% 
+      filter(!(is.na(KPI_2)))
+    
+    # Update new_data for the next iteration
+    new_data <- df_combined %>%
+      filter(is.na(KPI_2)) %>%
+      select(-KPI_2) %>%
+      filter(!(is.na(KPI_2_lag1)))
+  }
+  
+  return(modeltime_actual_data_format)
+}
+
+# Generates forecast
+forecast_results <- generate_forecast(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon)
+
+forecast_results %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+
+Export <- forecast_results %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export, "forecasts/KPI_2_forecast.csv")
+```
+
+
+######################################################################################
+#
+# KPI_3
+#
+######################################################################################
+
+
+```{r}
+# Load in Raw Data
+df_KPI_3 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_3") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, KPI_3)
+
+names(df_KPI_3) <- c("Date", "KPI_3")
+
+df_promos <- read_xlsx("data/Forecast_Data.xlsx", sheet = "JPN_Promos") %>%
+  mutate(Date = ymd(Date),
+         Promo_1 = as.integer(Promo_1),
+         Promo_2 = as.integer(Promo_2),
+         Promo_3 = as.integer(Promo_3),
+         Promo_4 = as.integer(Promo_4),
+         Promo_5 = as.integer(Promo_12),
+         Promo_6 = as.integer(Promo_6),
+         Promo_7 = as.integer(Promo_7),
+         Promo_8 = as.integer(Promo_8),
+         Promo_9 = as.integer(Promo_9),
+         Promo_13 = as.integer(Promo_13),
+         Promo_10 = as.integer(Promo_10),          
+         Promo_11 = as.integer(Promo_11),
+         Promo_12 = as.integer(Promo_12)) %>%
+  select(-Promo_12) %>%
+  select(-Promo_12)
+
+
+###################################################################
+# Loads Cust_type_1 KPI_2 Forecast
+###
+
+df_Cust_type_1_KPI_2 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_2") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, Cust_type_1_KPI_2) 
+
+names(df_Cust_type_1_KPI_2) <- c("Date", "Cust_type_1_KPI_2")
+
+df_Cust_type_1_KPI_2_Forecast <- read_csv("forecasts/Cust_type_1_KPI_2_forecast.csv")
+
+df_Cust_type_1_KPI_2_Forecast <- df_Cust_type_1_KPI_2_Forecast[,c(1,4)]
+names(df_Cust_type_1_KPI_2_Forecast) <- c("Date", "Cust_type_1_KPI_2")
+
+df_Cust_type_1_KPI_2 <- rbind(df_Cust_type_1_KPI_2, df_Cust_type_1_KPI_2_Forecast)
+
+rm(df_Cust_type_1_KPI_2_Forecast)
+
+
+###################################################################
+# Loads full KPI_2 Forecast
+###
+
+df_KPI_2 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_2") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, KPI_2) 
+
+names(df_KPI_2) <- c("Date", "KPI_2")
+
+df_KPI_2_Forecast <- read_csv("forecasts/KPI_2_forecast.csv")
+
+df_KPI_2_Forecast <- df_KPI_2_Forecast[,c(1,4)]
+names(df_KPI_2_Forecast) <- c("Date", "KPI_2")
+
+df_KPI_2 <- rbind(df_KPI_2, df_KPI_2_Forecast)
+
+rm(df_KPI_2_Forecast)
+###################################################################
+
+df_promos <- left_join(df_promos, df_KPI_2, by = "Date")
+df_promos <- left_join(df_promos, df_Cust_type_1_KPI_2, by = "Date")
+df_KPI_3 <- left_join(df_KPI_3, df_promos, by = "Date")
+
+rm(df_Cust_type_1_KPI_2,df_KPI_2)
+head(df_KPI_3)
+```
+
+```{r}
+df_KPI_3 %>%
+  ggplot(aes(Date, KPI_3)) +
+  geom_line() + 
+  geom_point()+
+  geom_smooth() +
+  labs(title = "KPI_3 - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+```
+
+```{r}
+# STL Decomposition
+detrended_Promo_5 <- df_KPI_3
+stl_decomposition <- stl(ts(detrended_Promo_5$KPI_3, frequency = 12), s.window = "periodic")
+trend_component <- stl_decomposition$time.series[, "trend"]
+detrended_Promo_5$detrended_stl <- detrended_Promo_5$KPI_3 - trend_component
+
+# Visualize
+ggplot(detrended_Promo_5, aes(Date, detrended_stl)) +
+  geom_line() + 
+  geom_point() +
+  geom_smooth() +
+  labs(title = "STL Detrended KPI_3 - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+
+# Plot ACF (Autocorrelation) and PACF (Partial Autocorrelation) with more lags
+acf(detrended_Promo_5$detrended_stl, lag.max = nrow(detrended_Promo_5), xlab="Lag (years)")
+pacf(detrended_Promo_5$detrended_stl, lag.max = nrow(detrended_Promo_5), xlab="Lag (years)")
+
+rm(detrended_Promo_5,trend_component,stl_decomposition)
+```
+
+
+```{r}
+df_KPI_3 %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+Data Preparation
+```{r}
+lag_df_KPI_3 <- df_KPI_3 %>%
+  arrange(Date) %>%
+  mutate(Promo_5_lag1 = lag(KPI_3, 1),
+         Promo_5_lag3 = lag(KPI_3, 3),
+         Promo_5_lag6 = lag(KPI_3, 6),
+         Promo_5_lag9 = lag(KPI_3, 9),
+         Promo_5_lag12 = lag(KPI_3, 12)) %>% 
+  drop_na()
+
+Splits <- initial_time_split(lag_df_KPI_3, prop = 0.85)
+
+Splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, KPI_3,.interactive = TRUE)
+```
+
+Model Pre-Processing
+```{r}
+recipe_spec <- recipe(KPI_3 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_2 <- recipe(KPI_3 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 2) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_3 <- recipe(KPI_3 ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 3) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+###########################
+# Recipe 1
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet <- workflow() %>%
+  add_model(fit_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 2
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_2 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_2 <- workflow() %>%
+  add_model(fit_glmnet_2) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_2<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_2 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_2 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_2 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Prophet
+fit_prophet_2 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 3
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_3 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_3 <- workflow() %>%
+  add_model(fit_glmnet_3) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_3 <- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_3 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_3 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_3 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Prophet
+fit_prophet_3 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+
+### Add fitted model to a Model Table
+models_tbl <-
+  modeltime_table(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3
+  )
+###########################
+
+rm(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3,
+    recipe_spec,
+    recipe_spec_2,
+    recipe_spec_3
+)
+
+### Calibration
+calibration_table <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(Splits))
+```
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(
+    new_data = testing(Splits),
+    actual_data = lag_df_KPI_3
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+```{r}
+dates <- KPI_1(df_KPI_3$Date)
+`%ni%` <- Negate(`%in%`)
+
+df_promos <- df_promos %>% 
+  select(Date, KPI_2, Cust_type_1_KPI_2, Promo_1, Promo_2, Promo_3, Promo_4, Promo_6, Promo_7, Promo_8, Promo_9, 
+         Promo_13, Promo_10, Promo_5, Promo_11) #Promo_12) #%>%
+  #filter(Date %ni% dates)
+
+df_promos <- recipe(Promo_5 ~ ., df_promos) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(df_promos)
+```
+
+
+```{r}
+# Finds the min RMSE model that is not overfitting
+min_rmse_model <- calibration_table %>%
+  modeltime_accuracy() %>%
+  filter(rsq < 0.97) %>%
+  filter(rmse == min(rmse)) %>%
+  select(.model_id) %>%
+  pull()
+
+#####
+# Luke test forecast
+#####
+
+df_combined <- left_join(df_promos, 
+                         df_KPI_3 %>% select(Date,KPI_3), 
+                         by = "Date") %>% 
+  arrange(Date)
+
+df_combined <- df_combined  %>%
+  mutate(Promo_5_lag1 = lag(KPI_3, 1),
+         Promo_5_lag3 = lag(KPI_3, 3),
+         Promo_5_lag6 = lag(KPI_3, 6),
+         Promo_5_lag9 = lag(KPI_3, 9),
+         Promo_5_lag12 = lag(KPI_3, 12)) %>%
+  filter(!(Date < "2020-01-01"))
+
+actual_sales_data <- df_combined %>%
+  filter(!(is.na(KPI_3)))
+
+new_data <- df_combined %>%
+  filter(is.na(KPI_3)) %>%
+  select(-KPI_3) %>%
+  filter(!(is.na(Promo_5_lag1)))
+
+# Defines how many months out you Cust_type_1nt to filter (6 = 6 months)
+forecast_horizon <- 10
+
+generate_forecast <- function(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon) {
+  
+  forecast_results <- actual_sales_data
+  
+  modeltime_actual_data_format <- actual_sales_data %>% 
+      mutate(
+        .index = Date,
+        .value = KPI_3,
+        .conf_lo = NA,
+        .conf_hi = NA,
+        .key = "actual",
+        .model_desc = "ACTUAL",
+        .model_id = NA
+    ) %>%
+    select(.index, .value, .conf_lo, .conf_hi, .key, .model_desc, .model_id)
+  
+  df_combined <- df_combined %>%
+    select(Date,KPI_3,KPI_2,Cust_type_1_KPI_2,Promo_1,Promo_2,Promo_3,Promo_4,Promo_6,Promo_7,Promo_8,Promo_9,Promo_13,Promo_10,
+           Promo_11,Promo_5,Promo_5_lag1,Promo_5_lag3,Promo_5_lag6,Promo_5_lag9,Promo_5_lag12)
+  
+  for (i in 1:forecast_horizon) {
+    forecast <- calibration_table %>%
+      filter(.model_id %in% min_rmse_model) %>%
+      modeltime_refit(df_combined %>%
+                        filter(!is.na(KPI_3)) %>% # Remove NAs in KPI_3
+                        filter(!is.na(Promo_5_lag1)) %>% # Remove NAs in Promo_5_lag1
+                        filter(!is.na(Promo_5_lag3)) %>%
+                        filter(!is.na(Promo_5_lag6)) %>%
+                        filter(!is.na(Promo_5_lag9)) %>%
+                        filter(!is.na(Promo_5_lag12))
+                      ) %>%
+      modeltime_forecast(
+        new_data = new_data,
+        actual_data = forecast_results
+      )
+    
+    # Extract the forecasted value
+    forecasted_value <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .value) %>%
+      slice_tail(n = 1) %>%
+      pull(.value)
+    
+    # Extract the .conf_lo value
+    forecasted_lo <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_lo) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_lo)
+    
+    # Extract the .conf_hi value
+    forecasted_hi <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_hi) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_hi)
+    
+    # Add the forecasted value to the results
+    next_date <- max(forecast_results$Date) + months(1)
+    next_row <- data.frame(Date = next_date,
+                           KPI_2 = forecasted_value,
+                           Promo_5_lag1 = NA)
+    
+    forecast_results <- bind_rows(forecast_results, next_row)
+    
+    #Creates a separate forecast table in the Modeltime format
+    Luke_forecast <- data.frame(
+      .index = next_date,
+      .value = forecasted_value,
+      .conf_lo = forecasted_lo,
+      .conf_hi = forecasted_hi,
+      .key = "prediction",
+      .model_desc = calibration_table %>%
+        filter(.model_id %in% min_rmse_model) %>%
+        pull(.model_desc),
+      .model_id = min_rmse_model
+    )
+    
+    modeltime_actual_data_format <- bind_rows(modeltime_actual_data_format,Luke_forecast)
+    
+    # Update lag_df_KPI_1 for next iteration
+    df_combined <- df_combined %>%
+      mutate(
+        KPI_3 = if_else(Date == next_date, forecasted_value, KPI_3),
+        Promo_5_lag1 = lag(KPI_3, 1),
+        Promo_5_lag3 = lag(KPI_3, 3),
+        Promo_5_lag6 = lag(KPI_3, 6),
+        Promo_5_lag9 = lag(KPI_3, 9),
+        Promo_5_lag12 = lag(KPI_3, 12)
+      )
+    
+    # Updates forecast_results
+    forecast_results <- df_combined %>% 
+      filter(!(is.na(KPI_3)))
+    
+    # Update new_data for the next iteration
+    new_data <- df_combined %>%
+      filter(is.na(KPI_3)) %>%
+      select(-KPI_3) %>%
+      filter(!(is.na(Promo_5_lag1)))
+  }
+  
+  return(modeltime_actual_data_format)
+}
+
+# Generates forecast
+forecast_results <- generate_forecast(min_rmse_model, actual_sales_data, df_combined, new_data, forecast_horizon)
+
+forecast_results %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+
+Export <- forecast_results %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export, "forecasts/KPI_3_forecast.csv")
+```
+
+
+
+######################################################################################
+#
+# KPI_4
+#
+######################################################################################
+
+```{r}
+# Load in Raw Data
+df_KPI_4 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_1_Purchasers") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, "KPI_4_Purchasers")
+
+names(df_KPI_4) <- c("Date", "KPI_4")
+
+df_promos <- read_xlsx("data/Forecast_Data.xlsx", sheet = "JPN_Promos") %>%
+  mutate(Date = ymd(Date),
+         Promo_1 = as.integer(Promo_1),
+         Promo_2 = as.integer(Promo_2),
+         Promo_3 = as.integer(Promo_3),
+         Promo_4 = as.integer(Promo_4),
+         Promo_5 = as.integer(Promo_12),
+         Promo_6 = as.integer(Promo_6),
+         Promo_7 = as.integer(Promo_7),
+         Promo_8 = as.integer(Promo_8),
+         Promo_9 = as.integer(Promo_9),
+         Promo_13 = as.integer(Promo_13),
+         Promo_10 = as.integer(Promo_10),          
+         Promo_11 = as.integer(Promo_11),
+         Promo_12 = as.integer(Promo_12)) %>%
+  select(-Promo_12) %>%
+  select(-Promo_12)
+
+#########################################
+
+df_KPI_1 <- read_xlsx("data/Forecast_Data.xlsx", sheet = "KPI_1_Purchasers") %>%
+  mutate(Date = ymd(Date)) %>%
+  select(Date, KPI_1_Purchasers)
+
+names(df_KPI_1) <- c("Date", "KPI_1")
+
+df_KPI_1_Forecast <- read_csv("forecasts/KPI_1Purchasers_forecast.csv")
+
+df_KPI_1_Forecast <- df_KPI_1_Forecast[,c(1,4)]
+
+names(df_KPI_1_Forecast) <- c("Date", "KPI_1")
+
+df_KPI_1 <- rbind(df_KPI_1, df_KPI_1_Forecast)
+
+rm(df_KPI_1_Forecast)
+
+###################################################################
+
+df_promos <- left_join(df_promos, df_KPI_1, by = "Date")
+df_KPI_4 <- left_join(df_KPI_4, df_promos, by = "Date")
+
+
+head(df_KPI_4)
+```
+
+
+```{r}
+df_KPI_4 %>%
+  ggplot(aes(Date, `KPI_4`)) +
+  geom_line() + 
+  geom_point()+
+  geom_smooth() +
+  labs(title = "KPI_4 Purchasers - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+```
+
+
+```{r}
+# STL Decomposition
+detrended_KPI_4 <- df_KPI_4
+stl_decomposition <- stl(ts(detrended_KPI_4$`KPI_4`, frequency = 12), s.window = "periodic")
+trend_component <- stl_decomposition$time.series[, "trend"]
+detrended_KPI_4$detrended_stl <- detrended_KPI_4$`KPI_4` - trend_component
+
+# Visualize
+ggplot(detrended_KPI_4, aes(Date, detrended_stl)) +
+  geom_line() + 
+  geom_point() +
+  geom_smooth() +
+  labs(title = "STL Detrended KPI_4 - Japan",
+       x = "",
+       y = "") + 
+  theme_classic()
+
+# Plot ACF (Autocorrelation) and PACF (Partial Autocorrelation) with more lags
+acf(detrended_KPI_4$detrended_stl, lag.max = nrow(detrended_KPI_4), xlab="Lag (years)")
+pacf(detrended_KPI_4$detrended_stl, lag.max = nrow(detrended_KPI_4), xlab="Lag (years)")
+
+rm(detrended_KPI_4,stl_decomposition,trend_component)
+```
+
+
+```{r}
+df_KPI_4 %>%
+  select(-Date) %>%
+  cor() %>%
+  round(2)
+```
+
+
+```{r}
+lag_df_KPI_4 <- df_KPI_4 %>%
+  arrange(Date) %>%
+  mutate(`KPI_4_lag1` = lag(`KPI_4`, 1),
+         `KPI_4_lag3` = lag(`KPI_4`, 3),
+         `KPI_4_lag6` = lag(`KPI_4`, 6),
+         `KPI_4_lag9` = lag(`KPI_4`, 9),
+         `KPI_4_lag12` = lag(`KPI_4`, 12)) %>% 
+  drop_na()
+
+Splits <- initial_time_split(lag_df_KPI_4, prop = 0.85)
+
+Splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date, `KPI_4`,.interactive = TRUE)
+```
+
+
+```{r}
+recipe_spec <- recipe(`KPI_4` ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_2 <- recipe(`KPI_4` ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 2) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+recipe_spec_3 <- recipe(`KPI_4` ~ ., training(Splits)) %>%
+  step_timeseries_signature(Date) %>%
+  step_fourier(Date, period = 12, K = 3) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  # step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+###########################
+# Recipe 1
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet <- workflow() %>%
+  add_model(fit_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+# Exponential Smoothing
+fit_ets <- workflow() %>%
+  add_model(exp_smoothing() %>% set_engine("ets")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+# Prophet
+fit_prophet <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 2
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_2 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_2 <- workflow() %>%
+  add_model(fit_glmnet_2) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_2<- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_2 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_2 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_2 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_2 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+
+# Prophet
+fit_prophet_2 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_2) %>%
+  fit(training(Splits))
+
+
+###########################
+# Recipe 3
+###########################
+
+### ML Models
+# Elastic Net
+fit_glmnet_3 <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+fit_glmnet_3 <- workflow() %>%
+  add_model(fit_glmnet_3) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Random Forest
+fit_rf_3 <- workflow() %>%
+  add_model(rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Gradient Boost
+fit_xgb_3 <- workflow() %>%
+  add_model(boost_tree("regression") %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_3 %>% step_rm(Date)) %>%
+  fit(training(Splits))
+
+# Prophet Boost Hybrid Model
+fit_prophet_boost_3 <- workflow() %>%
+  add_model(prophet_boost("regression", seasonality_yearly = TRUE) %>% set_engine("prophet_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+# Arima Boost
+fit_arima_boosted_3 <- workflow() %>%
+  add_model(arima_boost("regression") %>% set_engine("auto_arima_xgboost")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+### Non ML Moels
+
+# Prophet
+fit_prophet_3 <- workflow() %>%
+  add_model(prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec_3) %>%
+  fit(training(Splits))
+
+###########################
+
+### Add fitted model to a Model Table
+models_tbl <-
+  modeltime_table(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3
+  )
+###########################
+
+rm(
+    fit_glmnet,
+    fit_glmnet_2,
+    fit_glmnet_3,
+    fit_rf,
+    fit_rf_2,
+    fit_rf_3,
+    fit_xgb,
+    fit_xgb_2,
+    fit_xgb_3,
+    fit_prophet_boost,
+    fit_prophet_boost_2,
+    fit_prophet_boost_3,
+    fit_arima_boosted,
+    fit_arima_boosted_2,
+    fit_arima_boosted_3,
+    fit_ets,
+    fit_prophet,
+    fit_prophet_2,
+    fit_prophet_3,
+    recipe_spec,
+    recipe_spec_2,
+    recipe_spec_3
+)
+
+### Calibration
+calibration_table <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(Splits))
+```
+
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(
+    new_data = testing(Splits),
+    actual_data = lag_df_KPI_4
+    ) %>%
+  plot_modeltime_forecast(.interactive = TRUE)
+```
+
+
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = FALSE
+  )
+```
+
+
+```{r}
+dates <- KPI_1(lag_df_KPI_4$Date)
+`%ni%` <- Negate(`%in%`)
+
+df_promos <- df_promos %>% 
+  select(Date, KPI_1, Promo_1, Promo_2, Promo_3, Promo_4, Promo_6, Promo_7, Promo_8, Promo_9, Promo_13, 
+         Promo_10, Promo_5, Promo_11) #%>%
+  #filter(Date %ni% dates)
+
+df_promos <- recipe(Promo_5 ~ ., df_promos) %>%
+  step_timeseries_signature(Date) %>%
+  step_rm(matches("(hour)|(minute)|(second)|(am.pm)|(xts)|(iso)|(lbl)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  prep() %>%
+  juice()
+
+head(df_promos)
+```
+
+
+```{r}
+# Finds the min RMSE model that is not overfitting
+min_rmse_model <- calibration_table %>%
+  modeltime_accuracy() %>%
+  filter(rsq < 0.97) %>%
+  filter(rmse == min(rmse)) %>%
+  select(.model_id) %>%
+  pull()
+
+#####
+# Luke test forecast
+#####
+
+df_combined <- left_join(df_promos, 
+                         df_KPI_4 %>% select(Date,`KPI_4`), 
+                         by = "Date") %>% 
+  arrange(Date)
+
+df_combined <- df_combined  %>%
+  mutate(`KPI_4_lag1` = lag(`KPI_4`, 1),
+         `KPI_4_lag3` = lag(`KPI_4`, 3),
+         `KPI_4_lag6` = lag(`KPI_4`, 6),
+         `KPI_4_lag9` = lag(`KPI_4`, 9),
+         `KPI_4_lag12` = lag(`KPI_4`, 12)) %>%
+  filter(!(Date < "2020-01-01"))
+
+actual_KPI_1_data <- df_combined %>%
+  filter(!(is.na(`KPI_4`)))
+
+new_data <- df_combined %>%
+  filter(is.na(`KPI_4`)) %>%
+  select(-`KPI_4`) %>%
+  filter(!(is.na(`KPI_4_lag1`)))
+
+# Defines how many months out you Cust_type_1nt to filter (6 = 6 months)
+forecast_horizon <- 10
+
+generate_forecast <- function(min_rmse_model, actual_KPI_1_data, df_combined, new_data, forecast_horizon) {
+  
+  forecast_results <- actual_KPI_1_data
+  
+  modeltime_actual_data_format <- actual_KPI_1_data %>% 
+      mutate(
+        .index = Date,
+        .value = `KPI_4`,
+        .conf_lo = NA,
+        .conf_hi = NA,
+        .key = "actual",
+        .model_desc = "ACTUAL",
+        .model_id = NA
+    ) %>%
+    select(.index, .value, .conf_lo, .conf_hi, .key, .model_desc, .model_id)
+  
+  df_combined <- df_combined %>%
+    select(Date,`KPI_4`,KPI_1,Promo_1,Promo_2,Promo_3,Promo_4,Promo_6,Promo_7,Promo_8,Promo_9,Promo_13,Promo_10,Promo_11,Promo_5,
+           `KPI_4_lag1`,`KPI_4_lag3`,`KPI_4_lag6`,`KPI_4_lag9`,`KPI_4_lag12`)
+  
+  for (i in 1:forecast_horizon) {
+    forecast <- calibration_table %>%
+      filter(.model_id %in% min_rmse_model) %>%
+      modeltime_refit(df_combined %>%
+                        filter(!is.na(`KPI_4`)) %>% # Remove NAs in KPI_4
+                        filter(!is.na(`KPI_4_lag1`)) %>% # Remove NAs in KPI_4_lag1
+                        filter(!is.na(`KPI_4_lag3`)) %>%
+                        filter(!is.na(`KPI_4_lag6`)) %>%
+                        filter(!is.na(`KPI_4_lag9`)) %>%
+                        filter(!is.na(`KPI_4_lag12`)) 
+                      ) %>%
+      modeltime_forecast(
+        new_data = new_data,
+        actual_data = forecast_results
+      )
+    
+    # Extract the forecasted value
+    forecasted_value <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .value) %>%
+      slice_tail(n = 1) %>%
+      pull(.value)
+    
+    # Extract the .conf_lo value
+    forecasted_lo <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_lo) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_lo)
+    
+    # Extract the .conf_hi value
+    forecasted_hi <- forecast %>%
+      filter(.key == "prediction") %>%
+      select(.index, .conf_hi) %>%
+      slice_tail(n = 1) %>%
+      pull(.conf_hi)
+    
+    # Add the forecasted value to the results
+    next_date <- max(forecast_results$Date) + months(1)
+    next_row <- data.frame(Date = next_date,
+                           `KPI_4` = forecasted_value,
+                           `KPI_4_lag1` = NA,
+                           `KPI_4_lag3` = NA,
+                           `KPI_4_lag6` = NA,
+                           `KPI_4_lag9` = NA,
+                           `KPI_4_lag12` = NA)
+    
+    forecast_results <- bind_rows(forecast_results, next_row)
+    
+    #Creates a separate forecast table in the Modeltime format
+    Luke_forecast <- data.frame(
+      .index = next_date,
+      .value = forecasted_value,
+      .conf_lo = forecasted_lo,
+      .conf_hi = forecasted_hi,
+      .key = "prediction",
+      .model_desc = calibration_table %>%
+        filter(.model_id %in% min_rmse_model) %>%
+        pull(.model_desc),
+      .model_id = min_rmse_model
+    )
+    
+    modeltime_actual_data_format <- bind_rows(modeltime_actual_data_format,Luke_forecast)
+    
+    # Update lag_df_KPI_1 for next iteration
+    df_combined <- df_combined %>%
+      mutate(
+        `KPI_4` = if_else(Date == next_date, forecasted_value, `KPI_4`),
+        `KPI_4_lag1` = lag(`KPI_4`, 1),
+        `KPI_4_lag3` = lag(`KPI_4`, 3),
+        `KPI_4_lag6` = lag(`KPI_4`, 6),
+        `KPI_4_lag9` = lag(`KPI_4`, 9),
+        `KPI_4_lag12` = lag(`KPI_4`, 12)
+      )
+    
+    # Updates forecast_results
+    forecast_results <- df_combined %>% 
+      filter(!(is.na(`KPI_4`)))
+    
+    # Update new_data for the next iteration
+    new_data <- df_combined %>%
+      filter(is.na(`KPI_4`)) %>%
+      select(-`KPI_4`) %>%
+      filter(!(is.na(`KPI_4_lag1`)))
+  }
+  
+  return(modeltime_actual_data_format)
+}
+
+# Generates forecast
+forecast_results <- generate_forecast(min_rmse_model, actual_KPI_1_data, df_combined, new_data, forecast_horizon)
+
+forecast_results %>%
+  plot_modeltime_forecast(.interactive = FALSE)
+
+Export <- forecast_results %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.model_id, -.key) %>%
+  spread(key = .model_desc, value = .value) %>%
+  mutate(.index = ymd(.index))
+
+write_csv(Export, "forecasts/KPI_4_forecast.csv")
+```
+
